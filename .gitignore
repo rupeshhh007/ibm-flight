@@ -1,0 +1,13 @@
+backend/.venv/
+**/__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+*.db
+*.db-journal
+.env
+.env.*
+!.env.example
+frontend/node_modules/
+dist/
+coverage/

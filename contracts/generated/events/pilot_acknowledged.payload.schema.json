@@ -1,0 +1,47 @@
+{
+  "$defs": {
+    "PilotId": {
+      "enum": [
+        "PILOT_1",
+        "PILOT_2"
+      ],
+      "title": "PilotId",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "acknowledged_at": {
+      "format": "date-time",
+      "title": "Acknowledged At",
+      "type": "string"
+    },
+    "alert_id": {
+      "format": "uuid",
+      "title": "Alert Id",
+      "type": "string"
+    },
+    "command_id": {
+      "format": "uuid",
+      "title": "Command Id",
+      "type": "string"
+    },
+    "pilot_id": {
+      "$ref": "#/$defs/PilotId"
+    },
+    "scenario_run_id": {
+      "format": "uuid",
+      "title": "Scenario Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "command_id",
+    "scenario_run_id",
+    "pilot_id",
+    "alert_id",
+    "acknowledged_at"
+  ],
+  "title": "PilotAcknowledgement",
+  "type": "object"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "aeroguard-contract-client",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "generate:api": "openapi-typescript ../contracts/generated/openapi.json -o src/api/generated/schema.d.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "openapi-typescript": "7.10.1",
+    "typescript": "5.7.2"
+  }
+}

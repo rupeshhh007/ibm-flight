@@ -2,7 +2,7 @@
 
 ## Purpose and status
 
-This document defines the target architecture derived from the V3 master specification. The repository currently has no implementation; every component below is **planned** until source and tests verify it.
+This document defines the architecture derived from the V3 master specification. The P0 branch implements the canonical contracts, deterministic mocks/scenarios, single orchestrator, FastAPI REST API, SQLite audit/idempotency store, generated contracts, and tests. React UI, race-safe SSE, advanced scenarios/CV, and LinuxONE remain P1.
 
 > **SIMULATION ONLY — NOT FOR OPERATIONAL AVIATION USE**
 

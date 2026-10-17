@@ -6,7 +6,7 @@ AeroGuard is an IBM Z Datathon project for demonstrating a safe, auditable aviat
 
 ## Project status
 
-This repository currently contains the documentation foundation only. The FastAPI backend, React frontend, canonical Pydantic contracts, generated artifacts, scenarios, tests, and CI described below are **planned and not implemented**. Consequently, neither the P0 launch gate nor P1 baseline gate is satisfied. See [Blockers](docs/BLOCKERS.md) and the [Test Matrix](docs/TEST_MATRIX.md).
+The executable P0 foundation is implemented on `feat/p0-executable-foundation`: strict canonical Pydantic contracts, frozen Python Protocols, five deterministic scenario IDs, replaceable mocks, one FastAPI server/orchestrator, SQLite event and command persistence, generated OpenAPI/JSON Schema/TypeScript contracts, critical safety tests, and a connected-emergency smoke path. P1 remains open for the polished React UI, replay-safe SSE, richer five-scenario behavior, real CV, and LinuxONE deployment.
 
 ## Problem and proposed solution
 
@@ -25,13 +25,13 @@ The objective is a deterministic, locally runnable demonstration whose decisions
 
 | Capability | Intended behavior | Current status |
 |---|---|---|
-| Guardian monitoring | Correlate typed observations, telemetry, and acknowledgements | Specified only |
-| Sentinel response | Gate symbolic actions on incident/run identity and authorization | Specified only |
-| Synthetic simulator | Deterministic telemetry and independently validated symbolic actions | Specified only |
-| Vision adapter | Mock observations by default; optional local OpenCV/MediaPipe adapter | Specified only |
-| Simulated ATC | Fictional approve/reject workflow for the active incident | Specified only |
-| Dashboard | Cockpit, ATC, simulation, and audit views | Specified only |
-| Event audit | SQLite ordering, history, replay, and SSE delivery | Specified only |
+| Guardian monitoring | Correlate typed observations and acknowledgements | P0 deterministic mock implemented |
+| Sentinel response | Gate symbolic actions on incident/run identity and authorization | P0 connected-ATC path implemented |
+| Synthetic simulator | Deterministic telemetry and independently validated symbolic actions | P0 implemented |
+| Vision adapter | Mock observations by default; optional local OpenCV/MediaPipe adapter | Mock implemented; real CV is P1 |
+| Simulated ATC | Fictional approve/reject workflow for the active incident | P0 implemented |
+| Dashboard | Cockpit, ATC, simulation, and audit views | P1 |
+| Event audit | SQLite ordering and REST history | P0 implemented; SSE is P1 |
 | LinuxONE boundary | Optional supervisory event intake/audit/analytics | Conceptual and unverified |
 
 ## Safety invariants
@@ -74,30 +74,31 @@ AEROGUARD_CODEX_MASTER_BOOTSTRAP_V3.md  authoritative specification
 AGENTS.md                               coding-agent rules
 docs/                                  architecture and team documentation
 .github/pull_request_template.md        review checklist
-backend/                                planned FastAPI implementation
-frontend/                               planned React/Vite implementation
-contracts/                              planned fixtures/generated contracts
-scripts/                                planned generation and smoke tools
+backend/                                FastAPI app, contracts, mocks, store, tests
+frontend/                               pinned TypeScript contract-generation package
+contracts/                              validated fixtures and generated contracts
+scripts/                                deterministic generation, drift, and smoke tools
 ```
 
 ## Prerequisites and setup
 
-Planned prerequisites are Python 3.11, Node.js/npm, Git, and a platform with SQLite support. No setup script, dependency manifest, backend, or frontend exists yet. Therefore commands such as `make setup`, `make backend`, `make frontend`, `make dev`, `make test`, and `make smoke` are target commands, not currently runnable commands.
-
-When implementation lands, the intended workflow is:
+Prerequisites are Python 3.11 or newer, Node.js/npm, GNU Make, Git, and SQLite support from Python's standard library. Install into the repository-scoped virtual environment and run the verified P0 workflow:
 
 ```text
 make setup
-make dev
+make contracts-check
+make test
 make check
 make smoke
 ```
 
-The planned local backend address is `http://127.0.0.1:8000`; the Vite server will proxy API requests rather than hardcode a deployment host. The default mode must require no webcam, IBM connection, or paid API key.
+Run the single-worker backend with `make backend`; it listens at `http://127.0.0.1:8000`. On Windows, use `make PYTHON=python <target>` when `python3` is unavailable. The default mode requires no webcam, IBM connection, or paid API key.
+
+Troubleshooting: install Python 3.11+ if setup rejects the interpreter; install Node/npm if `npm` is missing; install GNU Make or run the displayed underlying commands if `make` is unavailable; stop the conflicting process or select an explicitly reviewed local port if port 8000 is occupied.
 
 ## Environment variables
 
-No `.env.example` exists yet. Planned configuration includes a local SQLite path, log level, CORS/dev origin, optional remote-sync enablement and URL, and bounded SSE settings. Secrets must never be committed. Exact names will be defined by Abhinav with the backend configuration implementation and then documented here.
+`.env.example` defines `AEROGUARD_DATABASE_PATH`, defaulting to `aeroguard.db`. Local databases, virtual environments, caches, `.env` files, and `node_modules` are ignored. No secrets are required for P0.
 
 ## Scenario catalogue
 
@@ -111,15 +112,15 @@ The stable target scenario IDs are:
 | `dual_pilot_atc_disconnected` | Restricted fallback only after all stronger-evidence prerequisites |
 | `camera_obstructed` | `UNKNOWN` observation; no action from obstruction alone |
 
-These outcomes are specified but have not been verified. See [Demo Runbook](docs/DEMO_RUNBOOK.md).
+The normal, single-pilot safety-negative, connected dual-pilot approval, disconnected-no-fallback, and camera-obstruction behaviors are deterministic P0 baselines. Fuller scenario dynamics remain P1. See [Demo Runbook](docs/DEMO_RUNBOOK.md).
 
 ## Target API
 
-The frozen route names include health/readiness, state and scenario queries, scenario start/advance/reset, pilot acknowledgement, fictional ATC decision, communication-link change, incident history, event history, and event streaming under `/api/v1`. Exact request/response models remain blocked on canonical Pydantic implementation. See [Contracts](docs/CONTRACTS.md).
+P0 implements health/readiness, state and scenario queries, scenario start/advance/reset, pilot acknowledgement, fictional ATC decision, communication-link change, incident history, and bounded event history. Replay-safe `/api/v1/events/stream` is intentionally P1 and is not exposed as a placeholder. Exact models are generated from the live app; see [Contracts](docs/CONTRACTS.md).
 
 ## Testing and validation
 
-The intended gates cover model validation, event/payload consistency, deterministic state machines, authorization negatives, command deduplication, old-run isolation, ordered persistence, SSE replay, contract drift, frontend build, and mock end-to-end operation. No executable test suite exists today. See [Test Matrix](docs/TEST_MATRIX.md).
+`make test` executes contract, fixture, Protocol-conformance, clock, scenario, store, API, authorization, idempotency, and old-run tests. `make contracts-check` regenerates to temporary storage and compares artifacts without mutating the tree. `make check` also typechecks the generated TypeScript declaration. `make smoke` runs the connected emergency path and proves rejection/no-action, approval/one action, and duplicate suppression. See [Test Matrix](docs/TEST_MATRIX.md).
 
 ## Team
 
@@ -140,9 +141,10 @@ LinuxONE is optional and outside the local safety-critical path. The portable su
 
 ## Known limitations
 
-- Documentation exists before implementation.
-- Public Protocol signatures and concrete schemas cannot be frozen until source models exist.
-- No API, UI, event store, generated artifacts, scenarios, automated tests, or CI has been verified.
+- The P0 state is held in memory and is not reconstructed after a process restart; SQLite audit events and command results persist.
+- P0 has no live SSE endpoint or polished React dashboard.
+- Offline automatic fallback is deliberately not implemented; disconnection alone remains a tested no-action condition.
+- Scenario dynamics and Guardian evidence fusion are intentionally minimal replaceable baselines.
 - LinuxONE access and s390x dependency compatibility are unverified.
 - Nothing in this project is suitable for operational aviation use.
 

@@ -1,0 +1,111 @@
+{
+  "$defs": {
+    "AuthorizationSource": {
+      "enum": [
+        "NONE",
+        "SIMULATED_ATC",
+        "LOCAL_FALLBACK"
+      ],
+      "title": "AuthorizationSource",
+      "type": "string"
+    },
+    "DecisionResult": {
+      "enum": [
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "EXECUTED",
+        "FAILED"
+      ],
+      "title": "DecisionResult",
+      "type": "string"
+    },
+    "SentinelState": {
+      "enum": [
+        "STANDBY",
+        "AWAITING_ATC",
+        "LOCAL_FALLBACK",
+        "SIM_ACTION_RUNNING",
+        "COMPLETED",
+        "ABORTED"
+      ],
+      "title": "SentinelState",
+      "type": "string"
+    },
+    "SimulatorActionType": {
+      "enum": [
+        "NO_OP",
+        "SIM_HOLD_STATE",
+        "SIM_STABILIZE",
+        "SIM_SCRIPTED_DIVERSION",
+        "SIM_ABORT"
+      ],
+      "title": "SimulatorActionType",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "action_type": {
+      "$ref": "#/$defs/SimulatorActionType"
+    },
+    "authorization_source": {
+      "$ref": "#/$defs/AuthorizationSource"
+    },
+    "decision_id": {
+      "format": "uuid",
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "evidence_event_ids": {
+      "items": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "title": "Evidence Event Ids",
+      "type": "array"
+    },
+    "executed_at": {
+      "format": "date-time",
+      "title": "Executed At",
+      "type": "string"
+    },
+    "incident_id": {
+      "format": "uuid",
+      "title": "Incident Id",
+      "type": "string"
+    },
+    "reason": {
+      "maxLength": 1000,
+      "minLength": 1,
+      "title": "Reason",
+      "type": "string"
+    },
+    "result": {
+      "$ref": "#/$defs/DecisionResult"
+    },
+    "scenario_run_id": {
+      "format": "uuid",
+      "title": "Scenario Run Id",
+      "type": "string"
+    },
+    "sentinel_state": {
+      "$ref": "#/$defs/SentinelState"
+    }
+  },
+  "required": [
+    "decision_id",
+    "scenario_run_id",
+    "incident_id",
+    "sentinel_state",
+    "action_type",
+    "authorization_source",
+    "reason",
+    "evidence_event_ids",
+    "executed_at",
+    "result"
+  ],
+  "title": "SentinelDecision",
+  "type": "object"
+}

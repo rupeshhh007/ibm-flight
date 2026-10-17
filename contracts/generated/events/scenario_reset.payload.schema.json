@@ -1,0 +1,33 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "command_id": {
+      "format": "uuid",
+      "title": "Command Id",
+      "type": "string"
+    },
+    "new_scenario_run_id": {
+      "format": "uuid",
+      "title": "New Scenario Run Id",
+      "type": "string"
+    },
+    "previous_scenario_run_id": {
+      "format": "uuid",
+      "title": "Previous Scenario Run Id",
+      "type": "string"
+    },
+    "reset_at": {
+      "format": "date-time",
+      "title": "Reset At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "command_id",
+    "previous_scenario_run_id",
+    "new_scenario_run_id",
+    "reset_at"
+  ],
+  "title": "ScenarioResetPayload",
+  "type": "object"
+}

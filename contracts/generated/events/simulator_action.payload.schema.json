@@ -1,0 +1,84 @@
+{
+  "$defs": {
+    "AuthorizationSource": {
+      "enum": [
+        "NONE",
+        "SIMULATED_ATC",
+        "LOCAL_FALLBACK"
+      ],
+      "title": "AuthorizationSource",
+      "type": "string"
+    },
+    "DecisionResult": {
+      "enum": [
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "EXECUTED",
+        "FAILED"
+      ],
+      "title": "DecisionResult",
+      "type": "string"
+    },
+    "SimulatorActionType": {
+      "enum": [
+        "NO_OP",
+        "SIM_HOLD_STATE",
+        "SIM_STABILIZE",
+        "SIM_SCRIPTED_DIVERSION",
+        "SIM_ABORT"
+      ],
+      "title": "SimulatorActionType",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "action_id": {
+      "format": "uuid",
+      "title": "Action Id",
+      "type": "string"
+    },
+    "action_type": {
+      "$ref": "#/$defs/SimulatorActionType"
+    },
+    "applied_at": {
+      "format": "date-time",
+      "title": "Applied At",
+      "type": "string"
+    },
+    "authorization_source": {
+      "$ref": "#/$defs/AuthorizationSource"
+    },
+    "authorized": {
+      "title": "Authorized",
+      "type": "boolean"
+    },
+    "reason": {
+      "maxLength": 1000,
+      "minLength": 1,
+      "title": "Reason",
+      "type": "string"
+    },
+    "result": {
+      "$ref": "#/$defs/DecisionResult"
+    },
+    "scenario_run_id": {
+      "format": "uuid",
+      "title": "Scenario Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "action_id",
+    "scenario_run_id",
+    "action_type",
+    "authorization_source",
+    "authorized",
+    "result",
+    "reason",
+    "applied_at"
+  ],
+  "title": "SimulatorActionPayload",
+  "type": "object"
+}

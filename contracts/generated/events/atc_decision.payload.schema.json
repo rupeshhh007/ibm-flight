@@ -1,0 +1,69 @@
+{
+  "$defs": {
+    "ATCDecisionType": {
+      "enum": [
+        "APPROVE",
+        "REJECT"
+      ],
+      "title": "ATCDecisionType",
+      "type": "string"
+    },
+    "SimulatorActionType": {
+      "enum": [
+        "NO_OP",
+        "SIM_HOLD_STATE",
+        "SIM_STABILIZE",
+        "SIM_SCRIPTED_DIVERSION",
+        "SIM_ABORT"
+      ],
+      "title": "SimulatorActionType",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "command_id": {
+      "format": "uuid",
+      "title": "Command Id",
+      "type": "string"
+    },
+    "decision": {
+      "$ref": "#/$defs/ATCDecisionType"
+    },
+    "incident_id": {
+      "format": "uuid",
+      "title": "Incident Id",
+      "type": "string"
+    },
+    "issued_at": {
+      "format": "date-time",
+      "title": "Issued At",
+      "type": "string"
+    },
+    "operator_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Operator Id",
+      "type": "string"
+    },
+    "requested_action": {
+      "$ref": "#/$defs/SimulatorActionType"
+    },
+    "scenario_run_id": {
+      "format": "uuid",
+      "title": "Scenario Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "command_id",
+    "scenario_run_id",
+    "incident_id",
+    "decision",
+    "requested_action",
+    "operator_id",
+    "issued_at"
+  ],
+  "title": "ATCDecision",
+  "type": "object"
+}

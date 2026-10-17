@@ -1,0 +1,84 @@
+{
+  "$defs": {
+    "FlightPhase": {
+      "enum": [
+        "PREFLIGHT",
+        "CRUISE",
+        "DESCENT",
+        "COMPLETED"
+      ],
+      "title": "FlightPhase",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "active_warning_codes": {
+      "items": {
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 32,
+      "title": "Active Warning Codes",
+      "type": "array"
+    },
+    "aircraft_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Aircraft Id",
+      "type": "string"
+    },
+    "airspeed_kts": {
+      "maximum": 800.0,
+      "minimum": 0.0,
+      "title": "Airspeed Kts",
+      "type": "number"
+    },
+    "altitude_ft": {
+      "maximum": 70000.0,
+      "minimum": -1500.0,
+      "title": "Altitude Ft",
+      "type": "number"
+    },
+    "flight_phase": {
+      "$ref": "#/$defs/FlightPhase"
+    },
+    "heading_deg": {
+      "exclusiveMaximum": 360.0,
+      "minimum": 0.0,
+      "title": "Heading Deg",
+      "type": "number"
+    },
+    "latitude": {
+      "maximum": 90.0,
+      "minimum": -90.0,
+      "title": "Latitude",
+      "type": "number"
+    },
+    "longitude": {
+      "maximum": 180.0,
+      "minimum": -180.0,
+      "title": "Longitude",
+      "type": "number"
+    },
+    "simulation_time": {
+      "format": "date-time",
+      "title": "Simulation Time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "aircraft_id",
+    "simulation_time",
+    "altitude_ft",
+    "airspeed_kts",
+    "heading_deg",
+    "latitude",
+    "longitude",
+    "flight_phase",
+    "active_warning_codes"
+  ],
+  "title": "AircraftTelemetry",
+  "type": "object"
+}

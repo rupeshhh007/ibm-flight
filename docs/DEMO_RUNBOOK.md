@@ -4,36 +4,36 @@
 
 ## Status
 
-This is the target procedure. No backend, frontend, Makefile, scenarios, or tests currently exist, so none of these steps or outcomes has been executed. Replace status notes with verified evidence as implementation lands.
+The P0 backend, Makefile, five deterministic scenario IDs, REST workflow, tests, and smoke path are implemented. The polished frontend is P1, so use the REST API or `make smoke` until Tarun's UI lands. Expected P0 outcomes below are covered by API tests where marked; richer scenario presentation remains P1.
 
 ## Environment preparation
 
-Planned prerequisites are Python 3.11, Node.js/npm, Git, and SQLite support. The intended local flow is:
+Prerequisites are Python 3.11+, Node.js/npm, GNU Make, Git, and SQLite support. The verified P0 flow is:
 
 ```text
 make setup
 make check
 make smoke
-make dev
+make backend
 ```
 
-These commands are currently unavailable. Once implemented, `make dev` should start FastAPI at `127.0.0.1:8000` and Vite at the printed local URL, with Vite proxying API paths. The default demo must not require webcam access, LinuxONE, or credentials. Confirm `/healthz`, `/readyz`, `/api/v1/state`, and `/api/v1/scenarios` before presenting.
+`make backend` starts FastAPI at `127.0.0.1:8000`. `make dev` and the Vite UI are P1 and are not advertised as working. The default demo requires no webcam, LinuxONE, or credentials. Confirm `/healthz`, `/readyz`, `/api/v1/state`, and `/api/v1/scenarios` before presenting.
 
 ## Common scenario procedure
 
-1. Open Emergency Simulation and select the stable scenario ID.
-2. Start the scenario. Record the returned `scenario_run_id`; the first committed events should have increasing `seq` values.
-3. Open Cockpit Monitoring and confirm both pilot panels, synthetic telemetry, Guardian/Sentinel states, and the simulation banner.
+1. Use the generated OpenAPI at `/docs` or an API client to select the stable scenario ID; the visual Emergency Simulation screen is P1.
+2. Start the scenario through `POST /api/v1/scenarios/start`. Record the returned `scenario_run_id`; the first committed events have increasing `seq` values.
+3. Query `GET /api/v1/state` and confirm both pilot entries, synthetic telemetry, Guardian/Sentinel states, and the simulation-only status.
 4. Advance virtual time in bounded steps. Boundary events are expected to be inclusive; do not wait real minutes.
 5. Observe the audit timeline after each step and correlate incident evidence event IDs.
-6. Use the Fictional ATC screen only for the connected dual-pilot scenario.
+6. Use `POST /api/v1/atc/decision` only for the connected dual-pilot scenario; the fictional ATC screen is P1.
 7. Reset from the active run. Confirm a new run identity, initial state, retained old history, and rejection of any old-run command.
 
-API equivalents, once models are implemented, are `POST /api/v1/scenarios/start`, `/advance`, and `/reset`, plus `GET /api/v1/state` and `/events`. Exact JSON bodies must come from live OpenAPI; this runbook does not invent them.
+The request/response bodies are implemented Pydantic models and are available in live OpenAPI and `docs/CONTRACTS.md`. `make smoke` executes the complete connected path without manual database edits.
 
 ## Scenario 1: `normal_flight`
 
-### Expected, not yet verified
+### P0 verified behavior
 
 - Both pilot observations remain `RESPONSIVE`; telemetry is nominal and synthetic.
 - Guardian remains `NORMAL`; no active incident is produced.
@@ -46,7 +46,7 @@ Establish that the platform does not manufacture emergencies from normal data an
 
 ## Scenario 2: `single_pilot_unresponsive`
 
-### Expected, not yet verified
+### P0 verified behavior
 
 - One pilot receives repeated scripted concern observations while the other remains responsive.
 - Guardian may move through `SUSPECTED`/`AWAITING_ACK` and request acknowledgement.
@@ -60,7 +60,7 @@ Show conservative evidence fusion: one uncertain pilot does not equal aircraft t
 
 ## Scenario 3: `dual_pilot_atc_connected`
 
-### Expected, not yet verified
+### P0 verified behavior
 
 1. Advance until combined current-run evidence and missed acknowledgements create a Guardian escalation.
 2. Sentinel enters `AWAITING_ATC`; verify no action exists before an ATC decision.
@@ -76,7 +76,7 @@ The fictional ATC console is not real authentication. Its value is proving expli
 
 ## Scenario 4: `dual_pilot_atc_disconnected`
 
-### Expected, not yet verified
+### P0 verified negative behavior; positive offline fallback is P1
 
 1. Show that toggling simulated ATC to disconnected produces no action by itself.
 2. Advance the scripted scenario until stronger evidence includes both pilots, missed acknowledgements, an active escalation, and the current-run safety condition.
@@ -90,7 +90,7 @@ Disconnected mode is a constrained scripted demonstration, not an autopilot or r
 
 ## Scenario 5: `camera_obstructed`
 
-### Expected, not yet verified
+### P0 verified behavior
 
 - Camera unavailable/obstructed or face not visible yields `UNKNOWN` with reduced/appropriate quality.
 - Guardian does not upgrade obstruction into `POSSIBLY_UNRESPONSIVE`.

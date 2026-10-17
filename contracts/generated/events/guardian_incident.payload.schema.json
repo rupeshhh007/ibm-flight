@@ -1,0 +1,91 @@
+{
+  "$defs": {
+    "GuardianState": {
+      "enum": [
+        "NORMAL",
+        "SUSPECTED",
+        "AWAITING_ACK",
+        "ESCALATED",
+        "RECOVERING"
+      ],
+      "title": "GuardianState",
+      "type": "string"
+    },
+    "IncidentSeverity": {
+      "enum": [
+        "WARNING",
+        "CRITICAL"
+      ],
+      "title": "IncidentSeverity",
+      "type": "string"
+    },
+    "IncidentType": {
+      "enum": [
+        "PILOT_RESPONSE_REQUIRED",
+        "DUAL_PILOT_UNRESPONSIVE"
+      ],
+      "title": "IncidentType",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "acknowledgement_required": {
+      "title": "Acknowledgement Required",
+      "type": "boolean"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "evidence_event_ids": {
+      "items": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "minItems": 1,
+      "title": "Evidence Event Ids",
+      "type": "array"
+    },
+    "explanation": {
+      "maxLength": 1000,
+      "minLength": 1,
+      "title": "Explanation",
+      "type": "string"
+    },
+    "guardian_state": {
+      "$ref": "#/$defs/GuardianState"
+    },
+    "incident_id": {
+      "format": "uuid",
+      "title": "Incident Id",
+      "type": "string"
+    },
+    "incident_type": {
+      "$ref": "#/$defs/IncidentType"
+    },
+    "scenario_run_id": {
+      "format": "uuid",
+      "title": "Scenario Run Id",
+      "type": "string"
+    },
+    "severity": {
+      "$ref": "#/$defs/IncidentSeverity"
+    }
+  },
+  "required": [
+    "incident_id",
+    "scenario_run_id",
+    "incident_type",
+    "severity",
+    "guardian_state",
+    "evidence_event_ids",
+    "explanation",
+    "acknowledgement_required",
+    "created_at"
+  ],
+  "title": "GuardianIncident",
+  "type": "object"
+}

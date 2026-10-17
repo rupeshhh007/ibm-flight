@@ -1,0 +1,9 @@
+{
+  "command_id": "44444444-4444-4444-8444-444444444444",
+  "scenario_run_id": "22222222-2222-4222-8222-222222222222",
+  "incident_id": "55555555-5555-4555-8555-555555555555",
+  "decision": "APPROVE",
+  "requested_action": "SIM_STABILIZE",
+  "operator_id": "fictional-atc-demo",
+  "issued_at": "2026-01-01T00:00:03Z"
+}

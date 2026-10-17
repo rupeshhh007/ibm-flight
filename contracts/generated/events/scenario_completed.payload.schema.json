@@ -1,0 +1,20 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "completed_at": {
+      "format": "date-time",
+      "title": "Completed At",
+      "type": "string"
+    },
+    "scenario_id": {
+      "title": "Scenario Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "scenario_id",
+    "completed_at"
+  ],
+  "title": "ScenarioCompletedPayload",
+  "type": "object"
+}
