@@ -146,7 +146,6 @@ class DeterministicGuardianAgent:
         self._prune_expired(event.occurred_at)
 
         usable = self._is_usable(observation)
-        previous_status = pilot.latest_status
         pilot.last_observed_at = observation.observed_at
         pilot.last_event_seq = event.seq
         pilot.latest_status = observation.observation_status
@@ -159,7 +158,7 @@ class DeterministicGuardianAgent:
 
         pilot.unknown_streak = 0
         if observation.observation_status == PilotObservationStatus.RESPONSIVE:
-            self._consume_responsive(pilot, previous_status, observation.observed_at)
+            self._consume_responsive(pilot, observation.observed_at)
             return None
 
         self._consume_concern(pilot, event)
@@ -256,10 +255,9 @@ class DeterministicGuardianAgent:
     def _consume_responsive(
         self,
         pilot: _PilotEvidence,
-        previous_status: PilotObservationStatus | None,
         observed_at: datetime,
     ) -> None:
-        had_concern = bool(pilot.concerns) or previous_status == PilotObservationStatus.POSSIBLY_UNRESPONSIVE
+        had_concern = bool(pilot.concerns)
         pilot.concerns.clear()
         self._recompute_episode_start()
         pilot.latest_responsive_at = observed_at

@@ -79,7 +79,7 @@ class GuardianPolicy:
         )
         if acknowledgement_grace_ms > evidence_window_ms:
             raise ValueError("acknowledgement_grace_ms must be within the evidence window")
-        _require_int(
+        recovery_required = _require_int(
             "recovery_observations_required_per_pilot",
             self.recovery_observations_required_per_pilot,
             minimum=1,
@@ -110,3 +110,6 @@ class GuardianPolicy:
         minimum_window = spacing_ms * (concerns_required - 1)
         if evidence_window_ms < minimum_window:
             raise ValueError("evidence_window_ms is too short for the configured independent observations")
+        minimum_recovery_window = spacing_ms * (recovery_required - 1)
+        if evidence_window_ms < minimum_recovery_window:
+            raise ValueError("evidence_window_ms is too short for the configured recovery observations")

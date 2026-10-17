@@ -303,6 +303,23 @@ def test_evidence_window_expiry_boundary_is_inclusive(at_ms: int, expired: bool)
     assert (agent._episode_started_at is None) is expired
 
 
+def test_expired_status_does_not_force_recovery_while_peer_concern_is_live() -> None:
+    policy = GuardianPolicy(evidence_window_ms=1_000, acknowledgement_grace_ms=1_000)
+    agent = new_agent(policy)
+    agent.consume_observation(
+        observation_event(1, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=0)
+    )
+    agent.consume_observation(
+        observation_event(2, PilotId.PILOT_2, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=1_001)
+    )
+    assert not agent._pilots[PilotId.PILOT_1].concerns
+    agent.consume_observation(
+        observation_event(3, PilotId.PILOT_1, PilotObservationStatus.RESPONSIVE, at_ms=1_002)
+    )
+    assert agent.state == GuardianState.SUSPECTED
+    assert len(agent._pilots[PilotId.PILOT_2].concerns) == 1
+
+
 def test_processing_order_within_round_does_not_change_safety_outcome() -> None:
     evidence_sets = []
     for order in ((PilotId.PILOT_1, PilotId.PILOT_2), (PilotId.PILOT_2, PilotId.PILOT_1)):
@@ -689,6 +706,12 @@ def test_evidence_below_high_precision_quality_threshold_does_not_count() -> Non
         {"awaiting_ack_concerns": 1},
         {"acknowledgement_grace_ms": -1},
         {"recovery_observations_required_per_pilot": 0},
+        {
+            "minimum_independent_spacing_ms": 500,
+            "evidence_window_ms": 999,
+            "concerns_required_per_pilot": 2,
+            "recovery_observations_required_per_pilot": 3,
+        },
         {"max_evidence_per_pilot": 1},
         {"max_evidence_per_pilot": 33},
         {"max_processed_events": 4, "max_evidence_per_pilot": 3},
@@ -711,6 +734,15 @@ def test_rejected_invalid_policy_does_not_mutate_existing_agent() -> None:
     with pytest.raises(ValueError):
         GuardianPolicy(concerns_required_per_pilot=2.5)  # type: ignore[arg-type]
     assert (agent.state, agent.active_incident, agent.retained_event_count) == before
+
+
+def test_recovery_window_exactly_fits_independent_observations() -> None:
+    policy = GuardianPolicy(
+        minimum_independent_spacing_ms=500,
+        evidence_window_ms=1_000,
+        recovery_observations_required_per_pilot=3,
+    )
+    assert policy.recovery_observations_required_per_pilot == 3
 
 
 def test_processed_event_retention_is_bounded() -> None:
