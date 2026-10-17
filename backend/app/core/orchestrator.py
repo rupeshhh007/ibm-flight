@@ -14,6 +14,7 @@ from app.contracts.enums import (
     DecisionResult,
     EventSource,
     EventType,
+    GuardianState,
     PilotId,
     SentinelState,
     SimulatorActionType,
@@ -84,6 +85,9 @@ class Orchestrator:
         self._lock = threading.RLock()
         self._runner: ScenarioRunner | None = None
         self._incidents: list[GuardianIncident] = []
+        # Tracks incidents actually delivered to Sentinel in this run. A Guardian
+        # recovery must invalidate this grant even if Sentinel lacks revocation.
+        self._sentinel_admitted_incident_id: UUID | None = None
         now = self.clock.now()
         self._snapshot = SystemSnapshot(
             pilots=[PilotSnapshot(pilot_id=PilotId.PILOT_1), PilotSnapshot(pilot_id=PilotId.PILOT_2)],
@@ -126,6 +130,33 @@ class Orchestrator:
             raise DomainError("NO_ACTIVE_SCENARIO", "no scenario is active")
         if scenario_run_id != self._snapshot.scenario_run_id:
             raise DomainError("STALE_SCENARIO_RUN", "scenario_run_id does not match the active run")
+
+    def _refresh_guardian_snapshot(self) -> None:
+        """Mirror Guardian's authoritative state; never retain a retired alert."""
+        incident = self.guardian.active_incident
+        self._snapshot.guardian_state = self.guardian.state
+        self._snapshot.active_incident = incident.model_copy(deep=True) if incident else None
+        if incident is None or incident.incident_id != self._sentinel_admitted_incident_id:
+            self._sentinel_admitted_incident_id = None
+
+    def _require_delivered_active_incident(self) -> GuardianIncident:
+        """Only a still-escalated, already-handed-off incident may reach Sentinel."""
+        cached = self._snapshot.active_incident
+        active = self.guardian.active_incident
+        if active is None or self.guardian.state != GuardianState.ESCALATED:
+            self._refresh_guardian_snapshot()
+            raise DomainError("NO_ACTIVE_INCIDENT", "no active Guardian incident can authorize this command")
+        if (
+            cached is None
+            or cached != active
+            or self._sentinel_admitted_incident_id != active.incident_id
+        ):
+            self._refresh_guardian_snapshot()
+            raise DomainError(
+                "INCIDENT_NOT_SYNCHRONIZED",
+                "Guardian incident does not match the active Sentinel handoff",
+            )
+        return active
 
     def _event(
         self,
@@ -170,6 +201,7 @@ class Orchestrator:
             telemetry = self.simulator.start(run_id, request.scenario_id, now)
             self.guardian.reset(run_id)
             self.sentinel.reset(run_id, definition.atc_connected)
+            self._sentinel_admitted_incident_id = None
             self._snapshot = SystemSnapshot(
                 scenario_id=request.scenario_id,
                 scenario_run_id=run_id,
@@ -275,6 +307,7 @@ class Orchestrator:
                     self._incidents.append(incident)
                     self._snapshot.active_incident = incident
                     sentinel_decision = self.sentinel.on_incident(incident, now)
+                    self._sentinel_admitted_incident_id = incident.incident_id
                     derived.extend(
                         self._commit(
                             [
@@ -289,7 +322,9 @@ class Orchestrator:
                             ]
                         )
                     )
-            self._snapshot.guardian_state = self.guardian.state
+            # A later credible responsive observation may retire an earlier incident
+            # without emitting a new GuardianIncident. Never leave its snapshot live.
+            self._refresh_guardian_snapshot()
             self._snapshot.sentinel_state = self.sentinel.state
             response = CommandResponse(
                 command_id=request.command_id,
@@ -307,9 +342,8 @@ class Orchestrator:
             fingerprint = self._fingerprint(acknowledgement)
             if existing := self._existing(acknowledgement.command_id, fingerprint):
                 return existing
-            if self._snapshot.active_incident is None:
-                raise DomainError("NO_ACTIVE_INCIDENT", "no active incident can be acknowledged")
-            if acknowledgement.alert_id != self._snapshot.active_incident.incident_id:
+            active_incident = self._require_delivered_active_incident()
+            if acknowledgement.alert_id != active_incident.incident_id:
                 raise DomainError("INCIDENT_MISMATCH", "alert_id does not match the active incident")
             self.guardian.acknowledge(acknowledgement)
             stored = self._commit(
@@ -323,8 +357,7 @@ class Orchestrator:
                     )
                 ]
             )
-            self._snapshot.guardian_state = self.guardian.state
-            self._snapshot.active_incident = self.guardian.active_incident
+            self._refresh_guardian_snapshot()
             response = CommandResponse(
                 command_id=acknowledgement.command_id,
                 accepted=True,
@@ -341,9 +374,10 @@ class Orchestrator:
             fingerprint = self._fingerprint(decision)
             if existing := self._existing(decision.command_id, fingerprint):
                 return existing
-            if self._snapshot.active_incident is None:
-                raise DomainError("NO_ACTIVE_INCIDENT", "no active incident is awaiting a decision")
-            if decision.incident_id != self._snapshot.active_incident.incident_id:
+            # Guardian, not a possibly stale snapshot or Sentinel's retained state,
+            # is the current incident authority. This gate MUST precede decide().
+            active_incident = self._require_delivered_active_incident()
+            if decision.incident_id != active_incident.incident_id:
                 raise DomainError("INCIDENT_MISMATCH", "incident_id does not match the active incident")
             try:
                 sentinel_decision = self.sentinel.decide(decision)
@@ -475,6 +509,7 @@ class Orchestrator:
             telemetry = self.simulator.reset(new_run_id, scenario_id, now)
             self.guardian.reset(new_run_id)
             self.sentinel.reset(new_run_id, definition.atc_connected)
+            self._sentinel_admitted_incident_id = None
             self._snapshot = SystemSnapshot(
                 scenario_id=scenario_id,
                 scenario_run_id=new_run_id,
