@@ -44,18 +44,21 @@ def test_observe_returns_valid_canonical_pilot_observation(base_time: datetime) 
 
 
 def test_canonical_model_rejects_extra_fields(base_time: datetime) -> None:
+    data = {
+        "pilot_id": PilotId.PILOT_1,
+        "observed_at": base_time,
+        "observation_status": PilotObservationStatus.RESPONSIVE,
+        "camera_available": True,
+        "face_visible": True,
+        "eyes_closed": False,
+        "observation_duration_ms": 1000,
+        "observation_quality": 0.9,
+        "diagnosis": "invalid_extra_field",  # extra="forbid"
+    }
     with pytest.raises(ValidationError):
-        PilotObservation(
-            pilot_id=PilotId.PILOT_1,
-            observed_at=base_time,
-            observation_status=PilotObservationStatus.RESPONSIVE,
-            camera_available=True,
-            face_visible=True,
-            eyes_closed=False,
-            observation_duration_ms=1000,
-            observation_quality=0.9,
-            diagnosis="invalid_extra_field",  # extra="forbid"
-        )
+        PilotObservation.model_validate(data)
+    with pytest.raises(ValidationError):
+        PilotObservation(**data)
 
 
 def test_timestamp_normalization_naive_datetime() -> None:
