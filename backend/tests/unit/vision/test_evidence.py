@@ -1031,3 +1031,139 @@ def test_quality_threshold_precision_near_80_and_805(
     obs_805 = window_805.evaluate(PilotId.PILOT_1, base_time + timedelta(seconds=4), config)
     assert obs_805.observation_quality == pytest.approx(0.805, abs=1e-5)
     assert obs_805.observation_quality >= 0.805
+
+
+def test_duplicated_physical_frames_do_not_inflate_virtual_evidence_duration(
+    base_time: datetime,
+    config: VisionConfig,
+) -> None:
+    """
+    Regression test for Issue 2:
+    - At virtual 0 ms: frame A, closed eyes.
+    - At virtual 100 ms: new frame B, closed eyes.
+    - At virtual 1100, 2100, and 3100 ms: reuse physical frame B with same frame ID and capture time.
+    Only 100 ms separates distinct physical captures.
+    The system must NOT classify this as sustained 3-second eye closure (POSSIBLY_UNRESPONSIVE).
+    """
+    window = PilotEvidenceWindow()
+
+    # At virtual 0 ms: frame A, closed eyes
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=base_time,
+            monotonic_capture_time=100.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.12,
+            quality=0.95,
+            is_usable=True,
+            frame_id="frame_A",
+        )
+    )
+
+    # At virtual 100 ms: new frame B, closed eyes
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=base_time + timedelta(milliseconds=100),
+            monotonic_capture_time=100.1,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.12,
+            quality=0.95,
+            is_usable=True,
+            frame_id="frame_B",
+        )
+    )
+
+    # At virtual 1100, 2100, and 3100 ms: reuse physical frame B
+    for offset_ms in (1100, 2100, 3100):
+        window.add_sample(
+            PilotFrameEvidence(
+                virtual_time=base_time + timedelta(milliseconds=offset_ms),
+                monotonic_capture_time=100.1,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=True,
+                ear=0.12,
+                quality=0.95,
+                is_usable=True,
+                frame_id="frame_B",
+            )
+        )
+
+    eval_time = base_time + timedelta(milliseconds=3100)
+    obs = window.evaluate(PilotId.PILOT_1, eval_time, config)
+
+    # Must NOT be POSSIBLY_UNRESPONSIVE; only 100 ms separates distinct physical frames
+    assert obs.observation_status != PilotObservationStatus.POSSIBLY_UNRESPONSIVE
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+    # Effective evidence duration must reflect only the 100 ms distinct physical span
+    assert obs.observation_duration_ms == 100
+
+
+def test_duplicated_physical_frames_do_not_inflate_responsive_open_duration(
+    base_time: datetime,
+    config: VisionConfig,
+) -> None:
+    """
+    Regression test for Issue 2 (responsive path):
+    - At virtual 0 ms: frame A, open eyes (ear=0.32).
+    - At virtual 100 ms: new frame B, open eyes (ear=0.32).
+    - At virtual 1100 ms: reuse physical frame B with same frame ID and capture time.
+    Only 100 ms separates distinct physical captures.
+    min_open_window_ms is 1000 ms.
+    Reused frame B must not inflate the span to 1100 ms to prematurely declare RESPONSIVE.
+    """
+    window = PilotEvidenceWindow()
+
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=base_time,
+            monotonic_capture_time=100.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.32,
+            quality=0.95,
+            is_usable=True,
+            frame_id="frame_A",
+        )
+    )
+
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=base_time + timedelta(milliseconds=100),
+            monotonic_capture_time=100.1,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.32,
+            quality=0.95,
+            is_usable=True,
+            frame_id="frame_B",
+        )
+    )
+
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=base_time + timedelta(milliseconds=1100),
+            monotonic_capture_time=100.1,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.32,
+            quality=0.95,
+            is_usable=True,
+            frame_id="frame_B",
+        )
+    )
+
+    eval_time = base_time + timedelta(milliseconds=1100)
+    obs = window.evaluate(PilotId.PILOT_1, eval_time, config)
+
+    # Must NOT be RESPONSIVE (needs >= 1000 ms distinct span); must be UNKNOWN with 100 ms
+    assert obs.observation_status != PilotObservationStatus.RESPONSIVE
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs.observation_duration_ms == 100

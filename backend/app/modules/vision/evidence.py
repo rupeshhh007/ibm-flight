@@ -212,11 +212,24 @@ class PilotEvidenceWindow:
             contiguous_samples.append(s)
             curr_t = s.virtual_time
 
-        # Filter contiguous samples to distinct physical frames to prevent repeated frames
-        # from inflating evidence duration.
+        # Filter contiguous samples to distinct physical frames (in chronological order: oldest to newest)
+        # to ensure that repeatedly observed identical physical frames cannot artificially inflate duration.
+        # NOTE ON LIVE-CAMERA VS VIRTUAL TIME EVIDENCE DURATION:
+        # In simulation mode, ReplayLandmarkSource generates distinct synthetic frames at virtual
+        # simulation steps, where duration is measured in virtual time milliseconds.
+        # In live-camera deployment, if the platform VirtualClock is decoupled from real wall-clock time,
+        # measuring evidence duration via virtual timestamps while physical frames arrive via monotonic wall-clock
+        # time creates a clock-domain impedance mismatch.
+        # Live camera deployment requires either:
+        # 1) Synchronizing VirtualClock 1:1 with wall-clock time (VirtualClock mode: REALTIME), OR
+        # 2) Extending the frozen contract (VisionAdapter / PilotObservation) to provide dual-clock
+        #    durations (capture_duration_ms alongside observation_duration_ms).
+        # To strictly adhere to frozen cross-module contracts without uncoordinated contract drift,
+        # we filter repeated physical frames chronologically so only distinct physical frame arrivals advance
+        # the duration span, while keeping the public observation_duration_ms contract intact.
         distinct_contiguous: list[PilotFrameEvidence] = []
         seen_contiguous_frames: set[object] = set()
-        for s in contiguous_samples:
+        for s in reversed(contiguous_samples):
             frame_key = s.frame_id if s.frame_id is not None else s.monotonic_capture_time
             if frame_key not in seen_contiguous_frames:
                 seen_contiguous_frames.add(frame_key)
@@ -225,7 +238,7 @@ class PilotEvidenceWindow:
         if len(distinct_contiguous) < 2:
             duration_ms = 0
         else:
-            duration_ms = int((distinct_contiguous[0].virtual_time - distinct_contiguous[-1].virtual_time).total_seconds() * 1000.0)
+            duration_ms = int((distinct_contiguous[-1].virtual_time - distinct_contiguous[0].virtual_time).total_seconds() * 1000.0)
             duration_ms = max(0, min(600_000, duration_ms))
 
         mean_q = sum(s.quality for s in contiguous_samples) / max(1, len(contiguous_samples))
@@ -254,10 +267,10 @@ class PilotEvidenceWindow:
                 closed_run.append(s)
                 curr_t = s.virtual_time
 
-            # Enforce physical frame independence: filter to distinct physical frames
+            # Enforce physical frame independence: filter to distinct physical frames (in chronological order)
             distinct_closed: list[PilotFrameEvidence] = []
             seen_closed_frames: set[object] = set()
-            for s in closed_run:
+            for s in reversed(closed_run):
                 frame_key = s.frame_id if s.frame_id is not None else s.monotonic_capture_time
                 if frame_key not in seen_closed_frames:
                     seen_closed_frames.add(frame_key)
@@ -265,7 +278,7 @@ class PilotEvidenceWindow:
 
             if len(distinct_closed) >= 2:
                 # Span between latest distinct physical frame and earliest distinct physical frame
-                closed_span_ms = int((distinct_closed[0].virtual_time - distinct_closed[-1].virtual_time).total_seconds() * 1000.0)
+                closed_span_ms = int((distinct_closed[-1].virtual_time - distinct_closed[0].virtual_time).total_seconds() * 1000.0)
                 if (
                     closed_span_ms >= config.min_closed_window_ms
                     and closed_span_ms >= config.min_observation_duration_ms
@@ -304,10 +317,10 @@ class PilotEvidenceWindow:
                 open_run.append(s)
                 curr_t = s.virtual_time
 
-            # Enforce physical frame independence: filter to distinct physical frames
+            # Enforce physical frame independence: filter to distinct physical frames (in chronological order)
             distinct_open: list[PilotFrameEvidence] = []
             seen_open_frames: set[object] = set()
-            for s in open_run:
+            for s in reversed(open_run):
                 frame_key = s.frame_id if s.frame_id is not None else s.monotonic_capture_time
                 if frame_key not in seen_open_frames:
                     seen_open_frames.add(frame_key)
@@ -315,7 +328,7 @@ class PilotEvidenceWindow:
 
             if len(distinct_open) >= 2:
                 # Span between latest distinct physical frame and earliest distinct physical frame
-                open_span_ms = int((distinct_open[0].virtual_time - distinct_open[-1].virtual_time).total_seconds() * 1000.0)
+                open_span_ms = int((distinct_open[-1].virtual_time - distinct_open[0].virtual_time).total_seconds() * 1000.0)
                 if (
                     open_span_ms >= config.min_open_window_ms
                     and open_span_ms >= config.min_observation_duration_ms

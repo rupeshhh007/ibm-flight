@@ -5,7 +5,7 @@ SIMULATION ONLY — NOT FOR OPERATIONAL AVIATION USE.
 """
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -416,4 +416,72 @@ def test_opencv_capture_source_pilot_specific_frame_tracking(base_time: datetime
         # Both received the valid frame identity
         assert s1.frame_id == 10
         assert s2.frame_id == 10
+        source.close()
+
+
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
+def test_opencv_capture_source_failed_capture_invalidates_cached_frame(base_time: datetime) -> None:
+    """
+    Deterministic regression for Issue 1:
+    Successful frame A followed by failed capture attempt B (read returning (False, None),
+    malformed frame, or exception) must immediately invalidate the cached frame.
+    A subsequent sample must not reuse frame A as a fresh valid observation.
+    """
+    import numpy as np
+
+    with patch("cv2.VideoCapture") as mock_cap_cls:
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+
+        # Successful Frame A
+        rng = np.random.default_rng(42)
+        frame_a = rng.integers(100, 140, size=(480, 640, 3), dtype=np.uint8)
+        mock_cap.read.return_value = (True, frame_a)
+        mock_cap_cls.return_value = mock_cap
+
+        # Valid face detector with plausible landmarks
+        valid_landmarks = create_synthetic_landmarks(ear=0.30)
+        source = OpenCVCaptureSource(
+            0,
+            face_detector=lambda crop: (True, valid_landmarks, None),
+        )
+
+        # Execute deterministic capture step for Frame A
+        source._capture_step()
+        config = VisionConfig.single_pilot(PilotId.PILOT_1)
+
+        sample_a = source.get_sample(PilotId.PILOT_1, base_time, config)
+        assert sample_a.is_usable is True
+        assert sample_a.camera_available is True
+        assert sample_a.face_visible is True
+        assert sample_a.frame_id is not None
+        captured_a_id = sample_a.frame_id
+
+        # Now simulate failed capture attempt B: read returns (False, None)
+        mock_cap.read.return_value = (False, None)
+        source._capture_step()
+
+        # Subsequent sample at base_time + 100ms must NOT reuse Frame A
+        sample_b = source.get_sample(PilotId.PILOT_1, base_time + timedelta(milliseconds=100), config)
+        assert sample_b.is_usable is False
+        assert sample_b.face_visible is False
+        assert sample_b.error_reason in ("no_frame_captured_yet", "camera_device_unavailable")
+        assert sample_b.frame_id is None
+
+        # Also verify malformed frame invalidation (size 0)
+        mock_cap.read.return_value = (True, np.array([]))
+        source._capture_step()
+        sample_c = source.get_sample(PilotId.PILOT_1, base_time + timedelta(milliseconds=200), config)
+        assert sample_c.is_usable is False
+        assert sample_c.face_visible is False
+        assert sample_c.frame_id is None
+
+        # Also verify exception invalidation
+        mock_cap.read.side_effect = RuntimeError("Hardware I/O error")
+        source._capture_step()
+        sample_d = source.get_sample(PilotId.PILOT_1, base_time + timedelta(milliseconds=300), config)
+        assert sample_d.is_usable is False
+        assert sample_d.face_visible is False
+        assert sample_d.frame_id is None
+
         source.close()

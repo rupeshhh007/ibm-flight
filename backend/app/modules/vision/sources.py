@@ -307,8 +307,8 @@ class OpenCVCaptureSource:
         self._latest_frame = None
         self._latest_mono: float = 0.0
         self._frame_seq: int = 0
-        self._latest_frame_id: int = 0
-        self._last_served_frame_id: dict[PilotId, int] = {}
+        self._latest_frame_id: int | None = None
+        self._last_served_frame_id: dict[PilotId, int | None] = {}
         self._last_served_mono: dict[PilotId, float] = {}
         self._running: bool = True
         self._thread = threading.Thread(target=self._capture_worker, daemon=True)
@@ -320,23 +320,53 @@ class OpenCVCaptureSource:
     ) -> None:
         self._face_detector = detector
 
+    def _capture_step(self) -> None:
+        """
+        Execute a single capture attempt from the underlying device.
+        On any read failure (e.g. read() returning False/None, malformed frame, or exception),
+        the cached frame is immediately invalidated so stale/cached evidence is never reused.
+        """
+        if self._cap is None:
+            with self._lock:
+                self._latest_frame = None
+                self._latest_mono = 0.0
+                self._latest_frame_id = None
+            return
+
+        try:
+            if not self._cap.isOpened():
+                with self._lock:
+                    self._latest_frame = None
+                    self._latest_mono = 0.0
+                    self._latest_frame_id = None
+                return
+
+            res = self._cap.read()
+            if isinstance(res, tuple) and len(res) == 2:
+                ret, frame = res
+                if ret and frame is not None and getattr(frame, "size", 0) > 0 and getattr(frame, "ndim", 0) >= 2:
+                    with self._lock:
+                        self._frame_seq += 1
+                        self._latest_frame = frame
+                        self._latest_mono = time.monotonic()
+                        self._latest_frame_id = self._frame_seq
+                    return
+
+            # Failed read, EOF, or malformed frame: immediately invalidate cached frame
+            with self._lock:
+                self._latest_frame = None
+                self._latest_mono = 0.0
+                self._latest_frame_id = None
+        except Exception:
+            with self._lock:
+                self._latest_frame = None
+                self._latest_mono = 0.0
+                self._latest_frame_id = None
+
     def _capture_worker(self) -> None:
         delay = 1.0 / max(1, self._target_fps)
         while self._running:
-            if self._cap is not None:
-                try:
-                    if self._cap.isOpened():
-                        res = self._cap.read()
-                        if isinstance(res, tuple) and len(res) == 2:
-                            ret, frame = res
-                            if ret and frame is not None:
-                                with self._lock:
-                                    self._frame_seq += 1
-                                    self._latest_frame = frame
-                                    self._latest_mono = time.monotonic()
-                                    self._latest_frame_id = self._frame_seq
-                except Exception:
-                    pass
+            self._capture_step()
             time.sleep(delay)
 
     def configure_scenario(self, scenario_id: str) -> None:
