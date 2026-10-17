@@ -35,7 +35,16 @@ class VisionAdapter(Protocol):
 - **`MockVisionAdapter`**: P0 default mock returning deterministic scenario outcomes for the 5 benchmark scenarios.
 - **`RealVisionAdapter`**: Uncertainty-aware real adapter using pure-Python geometry, bounded evidence windows, and configurable frame sources.
 - **`ReplayLandmarkSource`**: Deterministic replay provider with zero external dependencies.
-- **`OpenCVCaptureSource`**: Optional hardware camera / video file capture provider (requires optional `opencv-python`).
+- **`OpenCVCaptureSource`**: Optional hardware camera / video file capture provider (requires optional `opencv-python` and `mediapipe`).
+
+## Dependencies
+
+- **Offline/Replay Mode**: No external CV packages required (uses pure-Python geometry and synthetic landmarks).
+- **Optional Camera/MediaPipe Mode**: Pinned in `backend/app/modules/vision/requirements.txt` and root `requirements.txt`:
+  ```bash
+  pip install -r backend/app/modules/vision/requirements.txt
+  ```
+  Verified versions: `opencv-python==5.0.0.93`, `mediapipe==1.1.1`, `numpy==2.4.6`.
 
 ## Composition Root Integration (for Abhinav)
 
