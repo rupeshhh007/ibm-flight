@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.contracts.enums import PilotId, PilotObservationStatus
-from app.modules.vision.config import VisionConfig
+from app.modules.vision.config import PilotChannelConfig, VisionConfig
 from app.modules.vision.evidence import PilotEvidenceWindow, PilotFrameEvidence
 
 
@@ -424,8 +424,8 @@ def test_out_of_order_samples_are_rejected(base_time: datetime, config: VisionCo
         )
     )
 
-    # Out of order sample must not become latest
-    assert window.latest_sample.virtual_time == t2
+    # Out of order sample must reset the window to avoid stale/corrupted history leakage
+    assert window.latest_sample is None
 
 
 def test_repeated_duplicate_samples_do_not_inflate_duration(
@@ -520,12 +520,174 @@ def test_nan_and_inf_quality_handled_safely(base_time: datetime, config: VisionC
     assert obs.observation_quality == 0.0
 
 
-def test_naive_virtual_time_rejected_by_pilot_frame_evidence() -> None:
-    """Regression test: Naive virtual_time raises ValueError."""
+def test_naive_virtual_time_normalized_by_pilot_frame_evidence() -> None:
+    """Regression test: Naive virtual_time is safely normalized to UTC."""
     naive_dt = datetime(2026, 1, 1, 12, 0, 0)
-    with pytest.raises(ValueError, match="timezone-aware UTC"):
+    pfe = PilotFrameEvidence(
+        virtual_time=naive_dt,
+        monotonic_capture_time=100.0,
+        camera_available=True,
+        face_visible=True,
+        eyes_closed=False,
+        ear=0.30,
+        quality=0.90,
+        is_usable=True,
+    )
+    assert pfe.virtual_time.tzinfo == timezone.utc
+
+
+def test_evidence_window_rejects_brief_20ms_closed_eyes_after_long_open(base_time: datetime, config: VisionConfig) -> None:
+    """
+    Regression test for Re-review Item 3:
+    POSSIBLY_UNRESPONSIVE reproduced after only 20 ms of closed-eye evidence.
+    The closed-eye condition must independently satisfy min_closed_window_ms (3000ms),
+    not rely on earlier open-eye history duration.
+    """
+    window = PilotEvidenceWindow()
+    # 5 seconds of sustained open eyes (10 samples, 500ms apart)
+    for i in range(11):
+        t = base_time + timedelta(milliseconds=i * 500)
+        window.add_sample(
+            PilotFrameEvidence(
+                virtual_time=t,
+                monotonic_capture_time=100.0 + i * 0.5,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=False,
+                ear=0.32,
+                quality=0.95,
+                is_usable=True,
+            )
+        )
+
+    # Now add 2 closed samples spanning only 20 ms (e.g. at 5010ms and 5020ms)
+    t_closed_1 = base_time + timedelta(milliseconds=5010)
+    t_closed_2 = base_time + timedelta(milliseconds=5020)
+    window.add_sample(
         PilotFrameEvidence(
-            virtual_time=naive_dt,
+            virtual_time=t_closed_1,
+            monotonic_capture_time=105.01,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.10,
+            quality=0.95,
+            is_usable=True,
+        )
+    )
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t_closed_2,
+            monotonic_capture_time=105.02,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.10,
+            quality=0.95,
+            is_usable=True,
+        )
+    )
+
+    # Evaluating at 5020ms: closed evidence only spans 20ms (< 3000ms).
+    # MUST NOT emit POSSIBLY_UNRESPONSIVE! Must safely return UNKNOWN.
+    obs = window.evaluate(PilotId.PILOT_1, t_closed_2, config)
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+
+
+def test_evidence_window_rejects_brief_1ms_open_eyes_after_long_closed(base_time: datetime, config: VisionConfig) -> None:
+    """
+    Regression test for Re-review Item 3:
+    RESPONSIVE reproduced after only 1 ms of open-eye evidence.
+    The open-eye condition must independently satisfy min_open_window_ms (1000ms).
+    """
+    window = PilotEvidenceWindow()
+    # 5 seconds of sustained closed eyes (11 samples, 500ms apart)
+    for i in range(11):
+        t = base_time + timedelta(milliseconds=i * 500)
+        window.add_sample(
+            PilotFrameEvidence(
+                virtual_time=t,
+                monotonic_capture_time=100.0 + i * 0.5,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=True,
+                ear=0.08,
+                quality=0.95,
+                is_usable=True,
+            )
+        )
+
+    # Now add 2 open samples spanning only 1 ms (at 5001ms and 5002ms)
+    t_open_1 = base_time + timedelta(milliseconds=5001)
+    t_open_2 = base_time + timedelta(milliseconds=5002)
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t_open_1,
+            monotonic_capture_time=105.001,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.30,
+            quality=0.95,
+            is_usable=True,
+        )
+    )
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t_open_2,
+            monotonic_capture_time=105.002,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.30,
+            quality=0.95,
+            is_usable=True,
+        )
+    )
+
+    # Evaluating at 5002ms: open evidence only spans 1ms (< 1000ms).
+    # MUST NOT emit RESPONSIVE! Must safely return UNKNOWN.
+    obs = window.evaluate(PilotId.PILOT_1, t_open_2, config)
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+
+
+def test_evidence_window_ambiguous_ear_stays_unknown(base_time: datetime, config: VisionConfig) -> None:
+    """
+    Regression test for Re-review Item 5:
+    Ambiguous EAR (e.g. 0.22, between closed threshold 0.20 and open threshold 0.25)
+    must NOT be treated as open-eye evidence.
+    """
+    window = PilotEvidenceWindow()
+    # Feed 2 seconds of ambiguous samples (EAR=0.22)
+    for i in range(5):
+        t = base_time + timedelta(milliseconds=i * 500)
+        window.add_sample(
+            PilotFrameEvidence(
+                virtual_time=t,
+                monotonic_capture_time=100.0 + i * 0.5,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=False,
+                ear=0.22,  # Ambiguous!
+                quality=0.95,
+                is_usable=True,
+            )
+        )
+
+    obs = window.evaluate(PilotId.PILOT_1, base_time + timedelta(milliseconds=2000), config)
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+
+
+def test_evidence_window_out_of_order_resets_window(base_time: datetime, config: VisionConfig) -> None:
+    """Regression test for Re-review Item 4: out of order sample resets window to avoid leakage."""
+    window = PilotEvidenceWindow()
+    t1 = base_time + timedelta(seconds=1)
+    t2 = base_time + timedelta(seconds=2)
+    t_past = base_time + timedelta(milliseconds=500)
+
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t1,
             monotonic_capture_time=100.0,
             camera_available=True,
             face_visible=True,
@@ -533,4 +695,90 @@ def test_naive_virtual_time_rejected_by_pilot_frame_evidence() -> None:
             ear=0.30,
             quality=0.90,
             is_usable=True,
+        )
+    )
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t2,
+            monotonic_capture_time=101.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.30,
+            quality=0.90,
+            is_usable=True,
+        )
+    )
+    assert len(window._samples) == 2
+
+    # Out of order sample
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t_past,
+            monotonic_capture_time=102.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.30,
+            quality=0.90,
+            is_usable=True,
+        )
+    )
+    # Window must be reset to avoid corrupted timeline
+    assert len(window._samples) == 0
+
+
+def test_pilot_frame_evidence_rejects_quality_greater_than_one_and_invalid_ear(base_time: datetime) -> None:
+    """Regression test for Re-review Item 5: Quality > 1 and invalid EAR rejected."""
+    # Quality > 1.0
+    pfe_q = PilotFrameEvidence(
+        virtual_time=base_time,
+        monotonic_capture_time=100.0,
+        camera_available=True,
+        face_visible=True,
+        eyes_closed=False,
+        ear=0.30,
+        quality=1.5,
+        is_usable=True,
+    )
+    assert pfe_q.quality == 0.0
+    assert pfe_q.is_usable is False
+    assert pfe_q.error_reason == "invalid_numeric_quality"
+
+    # EAR > 1.0
+    pfe_ear = PilotFrameEvidence(
+        virtual_time=base_time,
+        monotonic_capture_time=100.0,
+        camera_available=True,
+        face_visible=True,
+        eyes_closed=False,
+        ear=2.5,
+        quality=0.90,
+        is_usable=True,
+    )
+    assert pfe_ear.ear is None
+    assert pfe_ear.is_usable is False
+    assert pfe_ear.error_reason == "invalid_numeric_ear"
+
+
+def test_config_rejects_non_finite_temporal_settings() -> None:
+    """Regression test for Re-review Item 5: nonfinite temporal settings rejected."""
+    with pytest.raises(ValueError, match="finite number"):
+        VisionConfig(min_closed_window_ms=float("nan"))
+
+    with pytest.raises(ValueError, match="finite number"):
+        VisionConfig(max_gap_ms=float("inf"))
+
+
+def test_config_requires_rois_when_pilots_share_source() -> None:
+    """
+    Regression test for Re-review Item 2:
+    Pilots sharing a source without explicit ROIs must be rejected.
+    """
+    with pytest.raises(ValueError, match="both pilots MUST have explicit, disjoint non-overlapping ROIs"):
+        VisionConfig(
+            pilot_channels={
+                PilotId.PILOT_1: PilotChannelConfig(pilot_id=PilotId.PILOT_1, camera_index=0, roi=None, enabled=True),
+                PilotId.PILOT_2: PilotChannelConfig(pilot_id=PilotId.PILOT_2, camera_index=0, roi=None, enabled=True),
+            }
         )

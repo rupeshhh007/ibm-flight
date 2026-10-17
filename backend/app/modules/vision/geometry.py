@@ -83,7 +83,7 @@ def euclidean_distance_2d(p1: Point2D, p2: Point2D) -> float:
 
 def calculate_eye_aspect_ratio(
     eye_points: tuple[Point2D, Point2D, Point2D, Point2D, Point2D, Point2D],
-) -> float:
+) -> float | None:
     """
     Compute Eye Aspect Ratio (EAR) from 6 2D landmarks:
     p1: outer corner
@@ -95,21 +95,30 @@ def calculate_eye_aspect_ratio(
 
     EAR = (|p2 - p6| + |p3 - p5|) / (2.0 * |p1 - p4|)
     Safely guarded against zero, near-zero, NaN, and Inf denominators.
+    Returns None if eye points are missing, out of bounds, degenerate, or zero-width.
     """
     try:
         p1, p2, p3, p4, p5, p6 = eye_points
+        for p in (p1, p2, p3, p4, p5, p6):
+            if not p.in_bounds():
+                return None
+
         horizontal_dist = euclidean_distance_2d(p1, p4)
-        if horizontal_dist < 1e-6 or math.isnan(horizontal_dist) or math.isinf(horizontal_dist):
-            return 0.0
+        # Eye width must be non-zero and physically plausible (at least 0.5% of normalized frame)
+        if horizontal_dist < 0.005 or math.isnan(horizontal_dist) or math.isinf(horizontal_dist):
+            return None
 
         v1 = euclidean_distance_2d(p2, p6)
         v2 = euclidean_distance_2d(p3, p5)
+        if math.isnan(v1) or math.isnan(v2) or math.isinf(v1) or math.isinf(v2):
+            return None
+
         ear = (v1 + v2) / (2.0 * horizontal_dist)
-        if math.isnan(ear) or math.isinf(ear):
-            return 0.0
-        return max(0.0, min(1.0, ear))
+        if math.isnan(ear) or math.isinf(ear) or ear < 0.0 or ear > 1.0:
+            return None
+        return round(max(0.0, min(1.0, ear)), 4)
     except Exception:
-        return 0.0
+        return None
 
 
 # MediaPipe FaceMesh standard landmark indices for left and right eyes
@@ -121,10 +130,10 @@ RIGHT_EYE_INDICES = (362, 385, 387, 263, 373, 380)
 
 def extract_ear_from_landmarks(
     landmarks: Sequence[Point2D] | dict[int, Point2D],
-) -> tuple[float, float, float]:
+) -> tuple[float | None, float | None, float | None]:
     """
     Extract (left_ear, right_ear, avg_ear) from landmark collection.
-    If points are missing or invalid, returns (0.0, 0.0, 0.0).
+    If points are missing, invalid, or zero-width, returns (None, None, None).
     """
     try:
         if isinstance(landmarks, dict):
@@ -134,13 +143,16 @@ def extract_ear_from_landmarks(
             left_points = tuple(landmarks[idx] for idx in LEFT_EYE_INDICES)
             right_points = tuple(landmarks[idx] for idx in RIGHT_EYE_INDICES)
     except (IndexError, KeyError, TypeError):
-        return 0.0, 0.0, 0.0
+        return None, None, None
 
     left_ear = calculate_eye_aspect_ratio(left_points)
     right_ear = calculate_eye_aspect_ratio(right_points)
+    if left_ear is None or right_ear is None:
+        return None, None, None
+
     avg_ear = (left_ear + right_ear) / 2.0
     if math.isnan(avg_ear) or math.isinf(avg_ear):
-        return 0.0, 0.0, 0.0
+        return None, None, None
     return left_ear, right_ear, round(avg_ear, 4)
 
 
@@ -197,6 +209,16 @@ def evaluate_landmark_quality(landmarks: Sequence[Point2D]) -> tuple[bool, float
         return False, 0.1
     if area > 0.98:
         return False, 0.2
+
+    # Check that eye landmarks exist and are not zero-width/degenerate
+    try:
+        if isinstance(landmarks, (list, tuple)) and len(landmarks) >= 388:
+            left_w = euclidean_distance_2d(landmarks[33], landmarks[133])
+            right_w = euclidean_distance_2d(landmarks[362], landmarks[263])
+            if left_w < 0.005 or right_w < 0.005:
+                return False, 0.0
+    except Exception:
+        return False, 0.0
 
     # Higher score for centered, well-sized faces with 100% in-bounds landmarks
     quality = min(1.0, 0.5 + 0.5 * ratio)

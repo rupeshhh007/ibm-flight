@@ -319,8 +319,18 @@ class OpenCVCaptureSource:
                                 with self._lock:
                                     self._latest_frame = frame
                                     self._latest_mono = time.monotonic()
+                            else:
+                                with self._lock:
+                                    self._latest_frame = None
+                        else:
+                            with self._lock:
+                                self._latest_frame = None
+                    else:
+                        with self._lock:
+                            self._latest_frame = None
                 except Exception:
-                    pass
+                    with self._lock:
+                        self._latest_frame = None
             time.sleep(delay)
 
     def configure_scenario(self, scenario_id: str) -> None:
@@ -430,6 +440,27 @@ class OpenCVCaptureSource:
                 )
             pilot_frame = frame[y1:y2, x1:x2]
         else:
+            # Enforce pilot isolation: if multiple pilots share this camera source,
+            # unassigned ROI is forbidden to prevent cross-pilot observation contamination.
+            other_pilots_on_source = [
+                ch for pid, ch in config.pilot_channels.items()
+                if pid != pilot_id and ch.enabled and (
+                    ch.camera_index == self._target or
+                    (ch.camera_index is None and (self._target == 0 or isinstance(self._target, str)))
+                )
+            ]
+            if other_pilots_on_source:
+                return PilotFrameEvidence(
+                    virtual_time=virtual_time,
+                    monotonic_capture_time=frame_mono,
+                    camera_available=True,
+                    face_visible=False,
+                    eyes_closed=False,
+                    ear=None,
+                    quality=0.0,
+                    is_usable=False,
+                    error_reason="unassigned_roi_on_shared_camera",
+                )
             pilot_frame = frame
 
         # Basic image quality: blur (Laplacian variance) and illumination (mean brightness)
@@ -498,6 +529,19 @@ class OpenCVCaptureSource:
                 )
 
             left_ear, right_ear, avg_ear = extract_ear_from_landmarks(landmarks)
+            if avg_ear is None or not (0.0 <= avg_ear <= 1.0):
+                return PilotFrameEvidence(
+                    virtual_time=virtual_time,
+                    monotonic_capture_time=frame_mono,
+                    camera_available=True,
+                    face_visible=True,
+                    eyes_closed=False,
+                    ear=None,
+                    quality=0.0,
+                    is_usable=False,
+                    error_reason="invalid_or_incomplete_eye_geometry",
+                )
+
             eyes_closed = avg_ear < config.eye_closed_ear_threshold
 
             return PilotFrameEvidence(

@@ -81,6 +81,11 @@ class VisionConfig:
             ("min_valid_frame_ratio", self.min_valid_frame_ratio),
             ("eye_closed_ear_threshold", self.eye_closed_ear_threshold),
             ("eye_open_ear_threshold", self.eye_open_ear_threshold),
+            ("min_observation_duration_ms", self.min_observation_duration_ms),
+            ("min_closed_window_ms", self.min_closed_window_ms),
+            ("min_open_window_ms", self.min_open_window_ms),
+            ("max_gap_ms", self.max_gap_ms),
+            ("max_frame_age_ms", self.max_frame_age_ms),
         ]:
             if not isinstance(val, (int, float)) or math.isnan(val) or math.isinf(val):
                 raise ValueError(f"{name} must be a finite number")
@@ -114,12 +119,18 @@ class VisionConfig:
         if self.max_frame_age_ms < 100:
             raise ValueError("max_frame_age_ms must be >= 100 ms")
 
-        # Non-overlap validation if both pilots share the same source and have ROIs
+        # Mandatory unambiguous, non-overlapping ROI validation for shared sources
         ch1 = self.pilot_channels.get(PilotId.PILOT_1)
         ch2 = self.pilot_channels.get(PilotId.PILOT_2)
         if ch1 and ch2 and ch1.enabled and ch2.enabled:
             same_source = (ch1.camera_index == ch2.camera_index and ch1.video_path == ch2.video_path)
-            if same_source and ch1.roi is not None and ch2.roi is not None:
+            if same_source:
+                if ch1.roi is None or ch2.roi is None:
+                    raise ValueError(
+                        "Pilot 1 and Pilot 2 share the same camera/video source and both are enabled; "
+                        "both pilots MUST have explicit, disjoint non-overlapping ROIs configured "
+                        "to prevent cross-pilot observation contamination."
+                    )
                 if ch1.roi.overlaps(ch2.roi):
                     raise ValueError(
                         f"Pilot 1 and Pilot 2 ROIs cannot overlap when sharing the same source! "

@@ -104,17 +104,17 @@ def test_calculate_eye_aspect_ratio_zero_denominator_guard() -> None:
     p6 = Point2D(0.2, 0.55)
 
     ear = calculate_eye_aspect_ratio((p1, p2, p3, p4, p5, p6))
-    assert ear == 0.0
+    assert ear is None
 
 
 def test_extract_ear_from_landmarks_missing_or_incomplete() -> None:
     # Empty list
     left, right, avg = extract_ear_from_landmarks([])
-    assert (left, right, avg) == (0.0, 0.0, 0.0)
+    assert (left, right, avg) == (None, None, None)
 
     # Incomplete dictionary
     left, right, avg = extract_ear_from_landmarks({33: Point2D(0.1, 0.1)})
-    assert (left, right, avg) == (0.0, 0.0, 0.0)
+    assert (left, right, avg) == (None, None, None)
 
 
 def test_evaluate_landmark_quality() -> None:
@@ -161,4 +161,4 @@ def test_geometry_nan_inf_safeguards() -> None:
     # calculate_eye_aspect_ratio returns 0.0 with NaN points
     p_valid = Point2D(0.5, 0.5)
     ear = calculate_eye_aspect_ratio((p_nan, p_valid, p_valid, p_valid, p_valid, p_valid))
-    assert ear == 0.0
+    assert ear is None

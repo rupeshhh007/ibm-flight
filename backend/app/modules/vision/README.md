@@ -32,10 +32,11 @@ class VisionAdapter(Protocol):
 
 ## Adapters
 
-- **`MockVisionAdapter`**: P0 default mock returning deterministic scenario outcomes for the 5 benchmark scenarios.
+- **`MockVisionAdapter`**: P0 operational default mock returning deterministic scenario outcomes for the 5 benchmark scenarios. Recommended and active in composition root.
 - **`RealVisionAdapter`**: Uncertainty-aware real adapter using pure-Python geometry, bounded evidence windows, and configurable frame sources.
-- **`ReplayLandmarkSource`**: Deterministic replay provider with zero external dependencies.
-- **`OpenCVCaptureSource`**: Optional hardware camera / video file capture provider (requires optional `opencv-contrib-python` and `mediapipe`).
+- **`ReplayLandmarkSource`**: Deterministic replay provider with zero external dependencies. Operational for offline test and demo execution.
+- **`OpenCVCaptureSource`**: Optional hardware camera / video file capture provider.
+  > **Operational Status**: Incomplete / non-operational in default composition root. Without manual face detector injection or loaded MediaPipe model assets, it safely fails closed to `UNKNOWN` (`error_reason="no_verified_face_detection_available"`). It remains disabled in default application composition until platform scenario scheduling is coordinated.
 
 ## Dependencies
 

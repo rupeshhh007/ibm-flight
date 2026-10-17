@@ -205,4 +205,3 @@ def test_config_safeguards_reject_zero_and_invalid_durations() -> None:
     # NaN / Inf in thresholds
     with pytest.raises(ValueError, match="finite number"):
         VisionConfig(min_usable_quality=float("nan"))
-

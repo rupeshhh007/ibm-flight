@@ -121,12 +121,21 @@ def test_replay_source_close(base_time: datetime, config: VisionConfig) -> None:
     assert sample.error_reason == "source_closed"
 
 
+try:
+    import cv2  # noqa: F401
+    import numpy as np  # noqa: F401
+    _CV_DEPS_AVAILABLE = True
+except ImportError:
+    _CV_DEPS_AVAILABLE = False
+
+
 def test_opencv_capture_source_missing_dependency() -> None:
     with patch("app.modules.vision.sources.is_opencv_available", return_value=False):
         with pytest.raises(RuntimeError, match="OpenCV .* is not installed"):
             OpenCVCaptureSource(0)
 
 
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
 def test_opencv_capture_source_clear_frame_no_face_fails_closed(base_time: datetime) -> None:
     """
     Regression test for Review Item 1:
@@ -160,6 +169,7 @@ def test_opencv_capture_source_clear_frame_no_face_fails_closed(base_time: datet
         source.close()
 
 
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
 def test_opencv_capture_source_respects_pilot_rois(base_time: datetime) -> None:
     """
     Regression test for Review Item 2:
@@ -208,6 +218,7 @@ def test_opencv_capture_source_respects_pilot_rois(base_time: datetime) -> None:
         source.close()
 
 
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
 def test_opencv_capture_source_mismatched_camera_index(base_time: datetime) -> None:
     """Regression test: source on camera 0 must not observe pilot assigned to camera 1."""
     with patch("cv2.VideoCapture") as mock_cap_cls:
@@ -228,4 +239,98 @@ def test_opencv_capture_source_mismatched_camera_index(base_time: datetime) -> N
         assert sample.camera_available is False
         assert sample.face_visible is False
         assert sample.error_reason == "channel_camera_mismatch"
+        source.close()
+
+
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
+def test_opencv_capture_source_invalid_eye_geometry_fails_closed(base_time: datetime) -> None:
+    """
+    Regression test for Re-review Item 1:
+    Zero-width or degenerate eye landmarks must NOT be interpreted as closed eyes.
+    Must return is_usable=False, ear=None, eyes_closed=False.
+    """
+    import numpy as np
+
+    with patch("cv2.VideoCapture") as mock_cap_cls:
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (False, None)
+        mock_cap_cls.return_value = mock_cap
+
+        # Landmark detector that returns valid face box, but all eye points are identical (zero width)
+        def degenerate_eye_detector(frame: np.ndarray) -> tuple[bool, list[Point2D], str | None]:
+            lmks = create_synthetic_landmarks(ear=0.30)
+            # Flatten eye points to identical coordinates (zero width)
+            for idx in (33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380):
+                lmks[idx] = Point2D(0.5, 0.5)
+            return True, lmks, None
+
+        source = OpenCVCaptureSource(0, face_detector=degenerate_eye_detector)
+        rng = np.random.default_rng(42)
+        frame = rng.integers(100, 140, size=(480, 640, 3), dtype=np.uint8)
+        source._latest_frame = frame
+        source._latest_mono = time.monotonic()
+
+        config = VisionConfig()
+        sample = source.get_sample(PilotId.PILOT_1, base_time, config)
+
+        # Must NOT confirm eye closure or responsiveness!
+        assert sample.eyes_closed is False
+        assert sample.is_usable is False
+        assert sample.ear is None
+        source.close()
+
+
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
+def test_opencv_capture_source_shared_camera_unassigned_roi_fails_closed(base_time: datetime) -> None:
+    """
+    Regression test for Re-review Item 2:
+    When multiple pilots share a camera and ROI is unassigned, source fails closed.
+    """
+    with patch("cv2.VideoCapture") as mock_cap_cls:
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (False, None)
+        mock_cap_cls.return_value = mock_cap
+
+        source = OpenCVCaptureSource(0)
+        rng = np.random.default_rng(42)
+        frame = rng.integers(100, 140, size=(480, 640, 3), dtype=np.uint8)
+        source._latest_frame = frame
+        source._latest_mono = time.monotonic()
+
+        # Both pilots on camera 0, but PILOT_1 has no ROI -> rejected by VisionConfig validation
+        with pytest.raises(ValueError, match="both pilots MUST have explicit, disjoint non-overlapping ROIs"):
+            VisionConfig(
+                pilot_channels={
+                    PilotId.PILOT_1: PilotChannelConfig(pilot_id=PilotId.PILOT_1, camera_index=0, roi=None),
+                    PilotId.PILOT_2: PilotChannelConfig(
+                        pilot_id=PilotId.PILOT_2,
+                        camera_index=0,
+                        roi=NormalizedROI(0.5, 0.0, 1.0, 1.0),
+                    ),
+                }
+            )
+        source.close()
+
+
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
+def test_opencv_capture_source_read_failure_invalidates_latest_frame(base_time: datetime) -> None:
+    """Regression test for Re-review Item 4: failed read invalidates latest frame."""
+    with patch("cv2.VideoCapture") as mock_cap_cls:
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        # Read returns False (e.g. frame drop / EOF)
+        mock_cap.read.return_value = (False, None)
+        mock_cap_cls.return_value = mock_cap
+
+        source = OpenCVCaptureSource(0)
+        # Manually invoke worker body step
+        with source._lock:
+            source._latest_frame = None
+
+        config = VisionConfig()
+        sample = source.get_sample(PilotId.PILOT_1, base_time, config)
+        assert sample.is_usable is False
+        assert sample.face_visible is False
         source.close()

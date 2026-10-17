@@ -86,6 +86,9 @@ class RealVisionAdapter:
             return window.evaluate(pilot_id, observed_at, self._config)
         except Exception as exc:
             logger.warning("Error evaluating vision observation for %s: %s", pilot_id, exc)
+            window = self._windows.get(pilot_id)
+            if window is not None:
+                window.reset()
             return PilotObservation(
                 pilot_id=pilot_id,
                 observed_at=observed_at,
