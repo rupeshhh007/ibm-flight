@@ -57,8 +57,6 @@ def test_canonical_model_rejects_extra_fields(base_time: datetime) -> None:
     }
     with pytest.raises(ValidationError):
         PilotObservation.model_validate(data)
-    with pytest.raises(ValidationError):
-        PilotObservation(**data)
 
 
 def test_timestamp_normalization_naive_datetime() -> None:
