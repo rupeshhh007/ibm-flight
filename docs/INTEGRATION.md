@@ -2,7 +2,7 @@
 
 ## Current readiness
 
-The executable P0 foundation is implemented for review on `feat/p0-executable-foundation`, based on `origin/main` commit `3fa3e5eaba1dae270e687ca33d87d2b05d9ccde9`. It includes canonical contracts/Protocols, replaceable mocks, deterministic scenarios, one orchestrator/FastAPI app, SQLite events and command idempotency, generated contracts, safety tests, and smoke tooling. Feature branches must still wait for the P0 PR to be reviewed and merged; the unmerged feature branch is not the shared baseline. Rupesh and Abhinav will announce the verified merged `main` SHA.
+The executable P0 foundation is implemented for review in [PR #1](https://github.com/rupeshhh007/ibm-flight/pull/1) from `feat/p0-executable-foundation`, based on `origin/main` commit `3fa3e5eaba1dae270e687ca33d87d2b05d9ccde9`. It includes canonical contracts/Protocols, replaceable mocks, deterministic scenarios, one orchestrator/FastAPI app, SQLite events and command idempotency, generated contracts, safety tests, and smoke tooling. Feature branches must still wait for the P0 PR to be reviewed and merged; the unmerged feature branch is not the shared baseline. Rupesh and Abhinav will announce the verified merged `main` SHA.
 
 ## Foundation and branch creation
 
