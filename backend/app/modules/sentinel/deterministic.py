@@ -22,10 +22,16 @@ class DeterministicSentinelAgent:
     decision, including its ID and timestamp. A link change invalidates that
     pending response. Running/completed lifecycles reject all incident delivery.
 
-    Phase 1 retains the mock's reject-then-approve and link-change behavior.
+    Retains the mock's reject-then-approve and conservative link-change behavior.
+    Reconnect leaves STANDBY unchanged: the orchestrator must redeliver the
+    retained identical, still-valid incident before a later ATC approval. The
+    current orchestrator does not perform that reconnect handoff.
+
     Command-ID replay protection remains an orchestrator responsibility until
     Phase 2. Evidence UUIDs are references, not independently verified evidence;
     v1 supplies neither fallback prerequisites nor recovery/failure callbacks.
+    Guardian recovery cannot revoke the retained incident through this Protocol.
+    The orchestrator must enforce current incident validity before calling decide.
     """
 
     _TRANSITIONS = {
@@ -59,6 +65,10 @@ class DeterministicSentinelAgent:
             raise ValueError("Sentinel rejected invalid or stale scenario_run_id")
 
     def reset(self, scenario_run_id: UUID, atc_connected: bool) -> None:
+        if not isinstance(scenario_run_id, UUID):
+            raise ValueError("scenario_run_id must be a UUID")
+        if type(atc_connected) is not bool:
+            raise ValueError("atc_connected must be a bool")
         # Reset is the sole operation allowed to reopen a terminal lifecycle.
         self._run_id = scenario_run_id
         self._atc_connected = atc_connected
@@ -144,6 +154,8 @@ class DeterministicSentinelAgent:
         return result
 
     def set_atc_link(self, scenario_run_id: UUID, connected: bool) -> None:
+        if type(connected) is not bool:
+            raise ValueError("connected must be a bool")
         self._require_run(scenario_run_id)
         if connected == self._atc_connected:
             return
@@ -153,6 +165,13 @@ class DeterministicSentinelAgent:
         self._pending = None
 
     def complete_action(self) -> None:
+        """Record the orchestrator's completion notification without executing.
+
+        The parameterless v1 callback cannot correlate a delayed notification to
+        a run/action or distinguish simulator success from failure. In particular,
+        an old callback arriving while a new run is running cannot be identified.
+        Only the orchestrator can supply that ordering/outcome guarantee today.
+        """
         if self._state != SentinelState.SIM_ACTION_RUNNING:
             raise ValueError("no simulator action is running")
         self._transition(SentinelState.COMPLETED)
