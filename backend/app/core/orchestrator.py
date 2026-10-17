@@ -122,6 +122,38 @@ class Orchestrator:
         prior = CommandResponse.model_validate_json(record.result_json)
         return prior.model_copy(update={"duplicate": True, "message": f"Duplicate command: {prior.message}"})
 
+    def _reject_unrecorded_atc_replay(self, request: ATCDecision, fingerprint: str) -> None:
+        """Fail closed on a durable ATC intent lacking a cached command result.
+
+        The existing EventStore Protocol exposes only paginated replay, not an
+        atomic command/outcome transaction. Never repeat a symbolic side effect
+        solely because record_command or the later audit append failed.
+        """
+        after_seq = 0
+        while True:
+            batch = self.store.read_after(after_seq, 500)
+            if not batch:
+                return
+            for event in batch:
+                if event.event_type != EventType.ATC_DECISION:
+                    continue
+                prior = event.payload
+                if not isinstance(prior, ATCDecision) or prior.command_id != request.command_id:
+                    continue
+                if self._fingerprint(prior) != fingerprint:
+                    raise DomainError(
+                        "COMMAND_ID_CONFLICT",
+                        "command_id was already used with a different ATC request",
+                    )
+                raise DomainError(
+                    "COMMAND_OUTCOME_UNCERTAIN",
+                    "ATC command was durably received but its cached result is missing; "
+                    "do not retry this action until the audit has been reconciled",
+                )
+            after_seq = batch[-1].seq
+            if len(batch) < 500:
+                return
+
     def _record(self, request: BaseModel, response: CommandResponse) -> None:
         self.store.record_command(
             CommandRecord(
@@ -411,6 +443,9 @@ class Orchestrator:
             fingerprint = self._fingerprint(decision)
             if existing := self._existing(decision.command_id, fingerprint):
                 return existing
+            # The write-ahead ATC intent is authoritative even when final response
+            # caching fails. Prevent replay across storage/HTTP error boundaries.
+            self._reject_unrecorded_atc_replay(decision, fingerprint)
             # Guardian, not a possibly stale snapshot or Sentinel's retained state,
             # is the current incident authority. This gate MUST precede decide().
             active_incident = self._require_delivered_active_incident()
@@ -438,6 +473,7 @@ class Orchestrator:
             ]
             message = "Simulated ATC rejection recorded; no action executed"
             accepted = True
+            intent_stored: list[StoredEvent] = []
             if decision.decision == ATCDecisionType.APPROVE:
                 # Simulator execution is a separate trust boundary. A positive ATC
                 # decision is NOT proof that the simulator executed successfully.
@@ -453,6 +489,22 @@ class Orchestrator:
                         "AUTHORIZATION_REJECTED",
                         "Sentinel did not issue a matching, approved simulated-action authorization",
                     )
+
+                # Durable authorization intent MUST precede the external simulator
+                # side effect. If storage or event publication fails here, do not
+                # invoke the simulator; the retained Sentinel state fails closed.
+                try:
+                    intent_stored = self._commit(domain_events)
+                    if len(intent_stored) != len(domain_events):
+                        raise RuntimeError("ATC intent append did not acknowledge all events")
+                except Exception as exc:
+                    logger.exception("ATC intent persistence failed; simulator was not invoked")
+                    raise DomainError(
+                        "ATC_INTENT_UNAVAILABLE",
+                        "Could not record ATC authorization intent; no simulator action was attempted",
+                        503,
+                    ) from exc
+                domain_events = []
 
                 action: SimulatorActionPayload | None = None
                 failure_reason: str | None = None
@@ -564,7 +616,20 @@ class Orchestrator:
                         if executed
                         else f"{failure_reason}; no successful execution recorded; reset/reconcile before retry"
                     )
-            stored = self._commit(domain_events)
+            # A simulator action can have executed even if the final append
+            # fails. Never retry an already-journaled ATC intent automatically.
+            try:
+                result_stored = self._commit(domain_events)
+            except Exception as exc:
+                self._snapshot.sentinel_state = self.sentinel.state
+                logger.exception("ATC result persistence failed; outcome may have side effects")
+                raise DomainError(
+                    "ATC_OUTCOME_UNCERTAIN",
+                    "Action outcome could not be durably recorded; do not retry or "
+                    "treat it as completed until the audit is reconciled",
+                    503,
+                ) from exc
+            stored = intent_stored + result_stored
             self._snapshot.sentinel_state = self.sentinel.state
             response = CommandResponse(
                 command_id=decision.command_id,
@@ -573,7 +638,16 @@ class Orchestrator:
                 snapshot=self.snapshot,
                 events=stored,
             )
-            self._record(decision, response)
+            try:
+                self._record(decision, response)
+            except Exception as exc:
+                logger.exception("ATC command-result caching failed after event persistence")
+                raise DomainError(
+                    "ATC_RESULT_CACHE_UNAVAILABLE",
+                    "ATC events were journaled but the command result is not cached; "
+                    "inspect the audit before attempting another command",
+                    503,
+                ) from exc
             return response
 
     def set_link(self, request: CommunicationLinkRequest) -> CommandResponse:
