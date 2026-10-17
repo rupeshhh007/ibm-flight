@@ -123,9 +123,10 @@ def test_replay_source_close(base_time: datetime, config: VisionConfig) -> None:
 
 try:
     import cv2  # noqa: F401
-    import numpy as np  # noqa: F401
+    import numpy as np
     _CV_DEPS_AVAILABLE = True
 except ImportError:
+    np = None  # type: ignore[assignment]
     _CV_DEPS_AVAILABLE = False
 
 
@@ -293,6 +294,8 @@ def test_opencv_capture_source_shared_camera_unassigned_roi_fails_closed(base_ti
         mock_cap.read.return_value = (False, None)
         mock_cap_cls.return_value = mock_cap
 
+        import numpy as np
+
         source = OpenCVCaptureSource(0)
         rng = np.random.default_rng(42)
         frame = rng.integers(100, 140, size=(480, 640, 3), dtype=np.uint8)
@@ -387,6 +390,8 @@ def test_opencv_capture_source_pilot_specific_frame_tracking(base_time: datetime
         mock_cap.isOpened.return_value = True
         mock_cap.read.return_value = (False, None)
         mock_cap_cls.return_value = mock_cap
+
+        import numpy as np
 
         source = OpenCVCaptureSource(0)
         rng = np.random.default_rng(42)

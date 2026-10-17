@@ -91,6 +91,7 @@ def test_calculate_eye_aspect_ratio_open_and_closed() -> None:
     p5_closed = Point2D(0.25, 0.505)
     p6_closed = Point2D(0.15, 0.505)
     ear_closed = calculate_eye_aspect_ratio((p1, p2_closed, p3_closed, p4, p5_closed, p6_closed))
+    assert ear_closed is not None
     assert ear_closed < 0.10
 
 

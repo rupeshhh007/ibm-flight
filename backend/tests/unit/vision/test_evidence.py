@@ -764,10 +764,10 @@ def test_pilot_frame_evidence_rejects_quality_greater_than_one_and_invalid_ear(b
 def test_config_rejects_non_finite_temporal_settings() -> None:
     """Regression test for Re-review Item 5: nonfinite temporal settings rejected."""
     with pytest.raises(ValueError, match="finite number"):
-        VisionConfig(min_closed_window_ms=float("nan"))
+        VisionConfig(min_closed_window_ms=float("nan"))  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match="finite number"):
-        VisionConfig(max_gap_ms=float("inf"))
+        VisionConfig(max_gap_ms=float("inf"))  # type: ignore[arg-type]
 
 
 def test_config_requires_rois_when_pilots_share_source() -> None:

@@ -82,7 +82,7 @@ def euclidean_distance_2d(p1: Point2D, p2: Point2D) -> float:
 
 
 def calculate_eye_aspect_ratio(
-    eye_points: tuple[Point2D, Point2D, Point2D, Point2D, Point2D, Point2D],
+    eye_points: Sequence[Point2D],
 ) -> float | None:
     """
     Compute Eye Aspect Ratio (EAR) from 6 2D landmarks:
