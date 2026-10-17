@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,7 @@ from app.contracts.models import (
     ScenarioResetRequest,
     ScenarioStartRequest,
     ScenarioStartedPayload,
+    SimulatorActionPayload,
     SentinelDecision,
     StoredEvent,
     SystemSnapshot,
@@ -55,6 +57,9 @@ from app.contracts.models import (
 from app.core.clock import VirtualClock
 from app.scenarios.catalog import get_scenario, list_scenarios
 from app.scenarios.runner import ScenarioRunner
+
+
+logger = logging.getLogger(__name__)
 
 
 class DomainError(Exception):
@@ -432,54 +437,138 @@ class Orchestrator:
                 ),
             ]
             message = "Simulated ATC rejection recorded; no action executed"
+            accepted = True
             if decision.decision == ATCDecisionType.APPROVE:
+                # Simulator execution is a separate trust boundary. A positive ATC
+                # decision is NOT proof that the simulator executed successfully.
+                if (
+                    sentinel_decision.scenario_run_id != decision.scenario_run_id
+                    or sentinel_decision.incident_id != decision.incident_id
+                    or sentinel_decision.action_type != decision.requested_action
+                    or sentinel_decision.authorization_source != AuthorizationSource.SIMULATED_ATC
+                    or sentinel_decision.result != DecisionResult.APPROVED
+                    or sentinel_decision.sentinel_state != SentinelState.SIM_ACTION_RUNNING
+                ):
+                    raise DomainError(
+                        "AUTHORIZATION_REJECTED",
+                        "Sentinel did not issue a matching, approved simulated-action authorization",
+                    )
+
+                action: SimulatorActionPayload | None = None
+                failure_reason: str | None = None
+                executed = False
                 try:
-                    action = self.simulator.apply_action(
+                    candidate = self.simulator.apply_action(
                         decision.scenario_run_id,
                         decision.requested_action,
                         sentinel_decision,
                         self.clock.now(),
                     )
-                except ValueError as exc:
-                    raise DomainError("SIMULATOR_REJECTED", str(exc)) from exc
-                domain_events.append(
-                    self._event(
-                        EventType.SIMULATOR_ACTION,
-                        EventSource.SIMULATOR,
-                        decision.scenario_run_id,
-                        decision.command_id,
-                        action,
+                except Exception:
+                    logger.exception("Simulator raised during a symbolic action attempt")
+                    failure_reason = "Simulator raised an error; execution outcome is unconfirmed"
+                else:
+                    # Revalidate mutable Pydantic models rather than trusting an
+                    # adapter's `model_copy(update=...)` or accidental wrong-run reply.
+                    try:
+                        if not isinstance(candidate, SimulatorActionPayload):
+                            raise ValueError("simulator returned a non-canonical action payload")
+                        candidate = SimulatorActionPayload.model_validate(candidate.model_dump())
+                    except Exception:
+                        failure_reason = "Simulator returned an invalid action payload; execution unconfirmed"
+                    else:
+                        if (
+                            candidate.scenario_run_id != decision.scenario_run_id
+                            or candidate.action_type != decision.requested_action
+                            or candidate.authorization_source != AuthorizationSource.SIMULATED_ATC
+                        ):
+                            failure_reason = "Simulator action context mismatch; execution unconfirmed"
+                        elif not candidate.authorized or candidate.result != DecisionResult.EXECUTED:
+                            failure_reason = "Simulator did not confirm authorized execution"
+                        else:
+                            action = candidate
+
+                if action is not None:
+                    # Record the actual successful action even if the subsequent
+                    # parameterless Sentinel completion callback should fail.
+                    domain_events.append(
+                        self._event(
+                            EventType.SIMULATOR_ACTION,
+                            EventSource.SIMULATOR,
+                            decision.scenario_run_id,
+                            decision.command_id,
+                            action,
+                        )
                     )
-                )
-                self.sentinel.complete_action()
-                completion = SentinelDecision(
-                    decision_id=uuid4(),
-                    scenario_run_id=decision.scenario_run_id,
-                    incident_id=decision.incident_id,
-                    sentinel_state=SentinelState.COMPLETED,
-                    action_type=decision.requested_action,
-                    authorization_source=AuthorizationSource.SIMULATED_ATC,
-                    reason="Simulator independently validated and executed one symbolic action.",
-                    evidence_event_ids=self._snapshot.active_incident.evidence_event_ids,
-                    executed_at=self.clock.now(),
-                    result=DecisionResult.EXECUTED,
-                )
-                domain_events.append(
-                    self._event(
-                        EventType.SENTINEL_DECISION,
-                        EventSource.SENTINEL,
-                        decision.scenario_run_id,
-                        decision.command_id,
-                        completion,
+                    executed = True
+                    self._snapshot.last_simulator_action = action
+                    try:
+                        self.sentinel.complete_action()
+                    except Exception:
+                        logger.exception("Sentinel completion failed after verified simulator action")
+                        failure_reason = "Simulator action executed, but Sentinel completion failed"
+                    else:
+                        completion = SentinelDecision(
+                            decision_id=uuid4(),
+                            scenario_run_id=decision.scenario_run_id,
+                            incident_id=decision.incident_id,
+                            sentinel_state=SentinelState.COMPLETED,
+                            action_type=decision.requested_action,
+                            authorization_source=AuthorizationSource.SIMULATED_ATC,
+                            reason="Simulator independently validated and executed one symbolic action.",
+                            evidence_event_ids=active_incident.evidence_event_ids,
+                            executed_at=self.clock.now(),
+                            result=DecisionResult.EXECUTED,
+                        )
+                        domain_events.append(
+                            self._event(
+                                EventType.SENTINEL_DECISION,
+                                EventSource.SENTINEL,
+                                decision.scenario_run_id,
+                                decision.command_id,
+                                completion,
+                            )
+                        )
+                        message = f"Executed one authorized symbolic action: {decision.requested_action.value}"
+
+                if failure_reason is not None:
+                    # The v1 Sentinel Protocol has no abort/failure transition.
+                    # Remain fail-closed in SIM_ACTION_RUNNING; never invent a
+                    # COMPLETED / EXECUTED decision for a failed or unknown result.
+                    failure = SentinelDecision(
+                        decision_id=uuid4(),
+                        scenario_run_id=decision.scenario_run_id,
+                        incident_id=decision.incident_id,
+                        sentinel_state=self.sentinel.state,
+                        action_type=decision.requested_action,
+                        authorization_source=AuthorizationSource.SIMULATED_ATC,
+                        reason=(
+                            f"{failure_reason}; reconcile or reset the scenario before a new attempt."
+                        ),
+                        evidence_event_ids=active_incident.evidence_event_ids,
+                        executed_at=self.clock.now(),
+                        result=DecisionResult.FAILED,
                     )
-                )
-                self._snapshot.last_simulator_action = action
-                message = f"Executed one authorized symbolic action: {decision.requested_action.value}"
+                    domain_events.append(
+                        self._event(
+                            EventType.SENTINEL_DECISION,
+                            EventSource.SENTINEL,
+                            decision.scenario_run_id,
+                            decision.command_id,
+                            failure,
+                        )
+                    )
+                    accepted = False
+                    message = (
+                        f"{failure_reason}; verified action recorded, but completion requires reconciliation"
+                        if executed
+                        else f"{failure_reason}; no successful execution recorded; reset/reconcile before retry"
+                    )
             stored = self._commit(domain_events)
             self._snapshot.sentinel_state = self.sentinel.state
             response = CommandResponse(
                 command_id=decision.command_id,
-                accepted=True,
+                accepted=accepted,
                 message=message,
                 snapshot=self.snapshot,
                 events=stored,
