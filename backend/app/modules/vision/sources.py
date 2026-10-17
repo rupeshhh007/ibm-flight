@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 from app.contracts.enums import PilotId
-from .config import VisionConfig
+from .config import VisionConfig, canonical_source_key
 from .evidence import PilotFrameEvidence
 from .geometry import (
     LEFT_EYE_INDICES,
@@ -143,11 +143,10 @@ class ReplayLandmarkSource:
         virtual_time: datetime,
         config: VisionConfig,
     ) -> PilotFrameEvidence:
-        # Normalize virtual_time to UTC
-        if virtual_time.tzinfo is None:
-            virtual_time = virtual_time.replace(tzinfo=timezone.utc)
-        else:
-            virtual_time = virtual_time.astimezone(timezone.utc)
+        # Strict timestamp validation: reject naive timestamps per contract
+        if virtual_time.tzinfo is None or virtual_time.utcoffset() is None:
+            raise ValueError("virtual_time datetime must be timezone-aware")
+        virtual_time = virtual_time.astimezone(timezone.utc)
 
         now_mono = time.monotonic()
         self._frame_seq += 1
@@ -373,12 +372,23 @@ class OpenCVCaptureSource:
         # Live video capture does not change hardware input on scenario reset
         pass
 
+    def canonical_source_key(self) -> tuple[str, int | str]:
+        """Return the canonical source identity for this capture source."""
+        if isinstance(self._target, (str, Path)):
+            return canonical_source_key(video_path=self._target)
+        return canonical_source_key(camera_index=self._target)
+
     def get_sample(
         self,
         pilot_id: PilotId,
         virtual_time: datetime,
         config: VisionConfig,
     ) -> PilotFrameEvidence:
+        # Strict timestamp validation: reject naive timestamps per contract
+        if virtual_time.tzinfo is None or virtual_time.utcoffset() is None:
+            raise ValueError("virtual_time datetime must be timezone-aware")
+        virtual_time = virtual_time.astimezone(timezone.utc)
+
         now_mono = time.monotonic()
 
         # Invariant: Channel must be explicitly configured and enabled
@@ -397,48 +407,20 @@ class OpenCVCaptureSource:
             )
 
         # Strict source identity validation: verify channel configuration matches this source
-        if channel.camera_index is not None:
-            if self._target != channel.camera_index:
-                return PilotFrameEvidence(
-                    virtual_time=virtual_time,
-                    monotonic_capture_time=now_mono,
-                    camera_available=False,
-                    face_visible=False,
-                    eyes_closed=False,
-                    ear=None,
-                    quality=0.0,
-                    is_usable=False,
-                    error_reason="channel_camera_mismatch",
-                )
-        elif channel.video_path is not None:
-            source_path = str(Path(self._target)) if isinstance(self._target, (str, Path)) else str(self._target)
-            expected_path = str(Path(channel.video_path))
-            if source_path != expected_path:
-                return PilotFrameEvidence(
-                    virtual_time=virtual_time,
-                    monotonic_capture_time=now_mono,
-                    camera_available=False,
-                    face_visible=False,
-                    eyes_closed=False,
-                    ear=None,
-                    quality=0.0,
-                    is_usable=False,
-                    error_reason="channel_video_path_mismatch",
-                )
-        else:
-            # Channel has neither camera_index nor video_path, implying default camera 0
-            if self._target != 0:
-                return PilotFrameEvidence(
-                    virtual_time=virtual_time,
-                    monotonic_capture_time=now_mono,
-                    camera_available=False,
-                    face_visible=False,
-                    eyes_closed=False,
-                    ear=None,
-                    quality=0.0,
-                    is_usable=False,
-                    error_reason="channel_camera_mismatch",
-                )
+        if channel.canonical_source_key() != self.canonical_source_key():
+            expected_type, _ = channel.canonical_source_key()
+            error_reason = "channel_video_path_mismatch" if expected_type == "video" else "channel_camera_mismatch"
+            return PilotFrameEvidence(
+                virtual_time=virtual_time,
+                monotonic_capture_time=now_mono,
+                camera_available=False,
+                face_visible=False,
+                eyes_closed=False,
+                ear=None,
+                quality=0.0,
+                is_usable=False,
+                error_reason=error_reason,
+            )
 
         if not self._cap or not self._cap.isOpened():
             return PilotFrameEvidence(

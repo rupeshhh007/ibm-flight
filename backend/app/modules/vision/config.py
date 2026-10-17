@@ -13,6 +13,20 @@ from app.contracts.enums import PilotId
 from .geometry import NormalizedROI
 
 
+def canonical_source_key(
+    camera_index: int | None = None,
+    video_path: Path | str | None = None,
+) -> tuple[str, int | str]:
+    """
+    Return a canonical tuple identifying a capture source:
+    - ("video", normalized_path_str) if video_path is provided
+    - ("camera", camera_index or 0) if camera_index is provided (or defaults to 0 if None)
+    """
+    if video_path is not None:
+        return ("video", str(Path(video_path)))
+    return ("camera", 0 if camera_index is None else camera_index)
+
+
 @dataclass(frozen=True, slots=True)
 class PilotChannelConfig:
     """
@@ -26,6 +40,10 @@ class PilotChannelConfig:
     camera_index: int | None = None
     video_path: Path | str | None = None
     enabled: bool = True
+
+    def canonical_source_key(self) -> tuple[str, int | str]:
+        """Return the canonical source identity for this channel."""
+        return canonical_source_key(self.camera_index, self.video_path)
 
 
 @dataclass
@@ -130,7 +148,7 @@ class VisionConfig:
         ch1 = self.pilot_channels.get(PilotId.PILOT_1)
         ch2 = self.pilot_channels.get(PilotId.PILOT_2)
         if ch1 and ch2 and ch1.enabled and ch2.enabled:
-            same_source = (ch1.camera_index == ch2.camera_index and ch1.video_path == ch2.video_path)
+            same_source = (ch1.canonical_source_key() == ch2.canonical_source_key())
             if same_source:
                 if ch1.roi is None or ch2.roi is None:
                     raise ValueError(

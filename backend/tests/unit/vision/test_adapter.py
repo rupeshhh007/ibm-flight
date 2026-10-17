@@ -59,11 +59,26 @@ def test_canonical_model_rejects_extra_fields(base_time: datetime) -> None:
         PilotObservation.model_validate(data)
 
 
-def test_timestamp_normalization_naive_datetime() -> None:
+def test_timestamp_normalization_and_naive_rejection() -> None:
     adapter = RealVisionAdapter()
+
+    # 1. Naive datetime must be explicitly rejected per frozen contract
     naive_time = datetime(2026, 1, 1, 12, 0, 0)
-    obs = adapter.observe(PilotId.PILOT_1, naive_time)
-    assert obs.observed_at.tzinfo == timezone.utc
+    with pytest.raises(ValueError, match="timezone-aware"):
+        adapter.observe(PilotId.PILOT_1, naive_time)
+
+    # 2. Timezone-aware UTC timestamp is accepted
+    utc_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    obs_utc = adapter.observe(PilotId.PILOT_1, utc_time)
+    assert obs_utc.observed_at == utc_time
+    assert obs_utc.observed_at.tzinfo == timezone.utc
+
+    # 3. Valid non-UTC timezone-aware timestamp is accepted and normalized to UTC
+    offset_tz = timezone(timedelta(hours=5, minutes=30))
+    offset_time = datetime(2026, 1, 1, 17, 30, 0, tzinfo=offset_tz)
+    obs_offset = adapter.observe(PilotId.PILOT_1, offset_time)
+    assert obs_offset.observed_at.tzinfo == timezone.utc
+    assert obs_offset.observed_at == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def test_independent_pilot_channels_no_leakage(base_time: datetime) -> None:

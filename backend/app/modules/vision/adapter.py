@@ -54,11 +54,10 @@ class RealVisionAdapter:
         """
         Produce a canonical PilotObservation for the requested pilot at the virtual timestamp.
         """
-        # Ensure timestamp is normalized timezone-aware UTC
+        # Strict timestamp validation: reject naive timestamps per contract
         if observed_at.tzinfo is None or observed_at.utcoffset() is None:
-            observed_at = observed_at.replace(tzinfo=timezone.utc)
-        else:
-            observed_at = observed_at.astimezone(timezone.utc)
+            raise ValueError("observed_at datetime must be timezone-aware")
+        observed_at = observed_at.astimezone(timezone.utc)
 
         # Invariant: Channel must be explicitly configured and enabled
         channel = self._config.pilot_channels.get(pilot_id)

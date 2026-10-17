@@ -520,11 +520,25 @@ def test_nan_and_inf_quality_handled_safely(base_time: datetime, config: VisionC
     assert obs.observation_quality == 0.0
 
 
-def test_naive_virtual_time_normalized_by_pilot_frame_evidence() -> None:
-    """Regression test: Naive virtual_time is safely normalized to UTC."""
+def test_naive_virtual_time_rejected_by_pilot_frame_evidence() -> None:
+    """Regression test: Naive virtual_time must be rejected, not silently converted."""
     naive_dt = datetime(2026, 1, 1, 12, 0, 0)
-    pfe = PilotFrameEvidence(
-        virtual_time=naive_dt,
+    with pytest.raises(ValueError, match="timezone-aware"):
+        PilotFrameEvidence(
+            virtual_time=naive_dt,
+            monotonic_capture_time=100.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.30,
+            quality=0.90,
+            is_usable=True,
+        )
+
+    # Timezone-aware UTC accepted
+    utc_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    pfe_utc = PilotFrameEvidence(
+        virtual_time=utc_dt,
         monotonic_capture_time=100.0,
         camera_available=True,
         face_visible=True,
@@ -533,7 +547,24 @@ def test_naive_virtual_time_normalized_by_pilot_frame_evidence() -> None:
         quality=0.90,
         is_usable=True,
     )
-    assert pfe.virtual_time.tzinfo == timezone.utc
+    assert pfe_utc.virtual_time == utc_dt
+    assert pfe_utc.virtual_time.tzinfo == timezone.utc
+
+    # Non-UTC timezone-aware accepted and converted to UTC
+    offset_tz = timezone(timedelta(hours=-5))
+    offset_dt = datetime(2026, 1, 1, 7, 0, 0, tzinfo=offset_tz)
+    pfe_offset = PilotFrameEvidence(
+        virtual_time=offset_dt,
+        monotonic_capture_time=100.0,
+        camera_available=True,
+        face_visible=True,
+        eyes_closed=False,
+        ear=0.30,
+        quality=0.90,
+        is_usable=True,
+    )
+    assert pfe_offset.virtual_time.tzinfo == timezone.utc
+    assert pfe_offset.virtual_time == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def test_evidence_window_rejects_brief_20ms_closed_eyes_after_long_open(base_time: datetime, config: VisionConfig) -> None:
@@ -1167,3 +1198,97 @@ def test_duplicated_physical_frames_do_not_inflate_responsive_open_duration(
     assert obs.observation_status != PilotObservationStatus.RESPONSIVE
     assert obs.observation_status == PilotObservationStatus.UNKNOWN
     assert obs.observation_duration_ms == 100
+
+
+def test_duplicate_timestamp_cannot_restore_invalidated_evidence(
+    base_time: datetime,
+    config: VisionConfig,
+) -> None:
+    """
+    MAJOR Regression Test for Issue 2:
+    An unusable sample at timestamp T establishes a permanent failure barrier.
+    A subsequent valid sample with the exact same timestamp T must NOT overwrite,
+    remove, or bypass that barrier, and must NOT restore prior evidence to produce
+    a false POSSIBLY_UNRESPONSIVE classification.
+    """
+    window = PilotEvidenceWindow()
+
+    # 1. Valid positive closed-eye evidence from 0s to 3s (3000 ms sustained)
+    for i in range(4):
+        window.add_sample(
+            PilotFrameEvidence(
+                virtual_time=base_time + timedelta(milliseconds=i * 1000),
+                monotonic_capture_time=100.0 + i,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=True,
+                ear=0.12,
+                quality=0.95,
+                is_usable=True,
+                frame_id=i + 1,
+            )
+        )
+
+    # 2. At timestamp T=3500ms, an unusable sample arrives (failure barrier)
+    barrier_time = base_time + timedelta(milliseconds=3500)
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=barrier_time,
+            monotonic_capture_time=104.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=None,
+            quality=0.0,
+            is_usable=False,
+            error_reason="camera_drop",
+            frame_id=99,
+        )
+    )
+
+    # Evaluation at barrier_time must be UNKNOWN
+    obs_barrier = window.evaluate(PilotId.PILOT_1, barrier_time, config)
+    assert obs_barrier.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs_barrier.observation_duration_ms == 0
+
+    # 3. A duplicate sample at timestamp T=3500ms arrives that claims to be valid
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=barrier_time,
+            monotonic_capture_time=105.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.12,
+            quality=0.95,
+            is_usable=True,
+            frame_id=100,
+        )
+    )
+
+    # 4. Evaluation at barrier_time must STILL be UNKNOWN and duration 0 (barrier preserved)
+    obs_dup = window.evaluate(PilotId.PILOT_1, barrier_time, config)
+    assert obs_dup.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs_dup.observation_duration_ms == 0
+
+    # 5. Subsequent valid sample arrives at T=4500ms
+    later_time = base_time + timedelta(milliseconds=4500)
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=later_time,
+            monotonic_capture_time=106.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.12,
+            quality=0.95,
+            is_usable=True,
+            frame_id=101,
+        )
+    )
+
+    # Evaluation at later_time must NOT reconnect the 0-3000ms evidence across the T=3500ms barrier
+    obs_later = window.evaluate(PilotId.PILOT_1, later_time, config)
+    assert obs_later.observation_status != PilotObservationStatus.POSSIBLY_UNRESPONSIVE
+    assert obs_later.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs_later.observation_duration_ms == 0

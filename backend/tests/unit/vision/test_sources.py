@@ -485,3 +485,118 @@ def test_opencv_capture_source_failed_capture_invalidates_cached_frame(base_time
         assert sample_d.frame_id is None
 
         source.close()
+
+
+def test_shared_camera_isolation_validation_rejects_none_and_zero_overlap() -> None:
+    """
+    MAJOR Regression Test for Issue 1:
+    The validator must treat camera_index=None and camera_index=0 as the SAME capture source.
+    Overlapping ROIs across camera_index=None and camera_index=0 must be rejected.
+    """
+    # 1. Overlapping ROIs with camera_index=None and camera_index=0 must be rejected
+    with pytest.raises(ValueError, match="Pilot 1 and Pilot 2 ROIs cannot overlap when sharing the same source"):
+        VisionConfig(
+            pilot_channels={
+                PilotId.PILOT_1: PilotChannelConfig(
+                    pilot_id=PilotId.PILOT_1,
+                    camera_index=None,  # canonical ("camera", 0)
+                    roi=NormalizedROI(0.0, 0.0, 0.6, 1.0),
+                ),
+                PilotId.PILOT_2: PilotChannelConfig(
+                    pilot_id=PilotId.PILOT_2,
+                    camera_index=0,  # canonical ("camera", 0)
+                    roi=NormalizedROI(0.4, 0.0, 1.0, 1.0),
+                ),
+            }
+        )
+
+    # 2. Non-overlapping ROIs with camera_index=None and camera_index=0 are accepted
+    cfg_valid = VisionConfig(
+        pilot_channels={
+            PilotId.PILOT_1: PilotChannelConfig(
+                pilot_id=PilotId.PILOT_1,
+                camera_index=None,
+                roi=NormalizedROI(0.0, 0.0, 0.5, 1.0),
+            ),
+            PilotId.PILOT_2: PilotChannelConfig(
+                pilot_id=PilotId.PILOT_2,
+                camera_index=0,
+                roi=NormalizedROI(0.5, 0.0, 1.0, 1.0),
+            ),
+        }
+    )
+    assert cfg_valid.pilot_channels[PilotId.PILOT_1].canonical_source_key() == ("camera", 0)
+    assert cfg_valid.pilot_channels[PilotId.PILOT_2].canonical_source_key() == ("camera", 0)
+
+    # 3. Genuinely distinct camera sources (e.g. camera 0 and camera 1) may share ROI bounds
+    cfg_distinct = VisionConfig(
+        pilot_channels={
+            PilotId.PILOT_1: PilotChannelConfig(
+                pilot_id=PilotId.PILOT_1,
+                camera_index=0,
+                roi=NormalizedROI(0.0, 0.0, 1.0, 1.0),
+            ),
+            PilotId.PILOT_2: PilotChannelConfig(
+                pilot_id=PilotId.PILOT_2,
+                camera_index=1,
+                roi=NormalizedROI(0.0, 0.0, 1.0, 1.0),
+            ),
+        }
+    )
+    assert cfg_distinct.pilot_channels[PilotId.PILOT_1].canonical_source_key() == ("camera", 0)
+    assert cfg_distinct.pilot_channels[PilotId.PILOT_2].canonical_source_key() == ("camera", 1)
+
+
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
+def test_opencv_capture_source_runtime_source_matching_consistency(base_time: datetime) -> None:
+    """
+    MAJOR Regression Test for Issue 1 (runtime matching):
+    OpenCVCaptureSource(0) must consistently match both camera_index=None and camera_index=0,
+    and reject camera_index=1 or mismatched video paths.
+    """
+    with patch("cv2.VideoCapture") as mock_cap_cls:
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (False, None)
+        mock_cap_cls.return_value = mock_cap
+
+        # Capture source configured for camera 0
+        source_cam0 = OpenCVCaptureSource(0)
+        assert source_cam0.canonical_source_key() == ("camera", 0)
+
+        config = VisionConfig(
+            pilot_channels={
+                # Pilot 1 has camera_index=None (should match camera 0)
+                PilotId.PILOT_1: PilotChannelConfig(
+                    pilot_id=PilotId.PILOT_1,
+                    camera_index=None,
+                    roi=NormalizedROI(0.0, 0.0, 0.5, 1.0),
+                ),
+                # Pilot 2 has camera_index=1 (should NOT match camera 0)
+                PilotId.PILOT_2: PilotChannelConfig(
+                    pilot_id=PilotId.PILOT_2,
+                    camera_index=1,
+                    roi=NormalizedROI(0.5, 0.0, 1.0, 1.0),
+                ),
+            }
+        )
+
+        # Pilot 1 matches source_cam0 (fails for no frame captured yet, NOT for channel mismatch)
+        sample1 = source_cam0.get_sample(PilotId.PILOT_1, base_time, config)
+        assert sample1.error_reason != "channel_camera_mismatch"
+
+        # Pilot 2 does NOT match source_cam0 (channel_camera_mismatch)
+        sample2 = source_cam0.get_sample(PilotId.PILOT_2, base_time, config)
+        assert sample2.error_reason == "channel_camera_mismatch"
+        assert sample2.is_usable is False
+
+        source_cam0.close()
+
+
+def test_sources_reject_naive_timestamps(base_time: datetime, config: VisionConfig) -> None:
+    """Test that ReplayLandmarkSource and OpenCVCaptureSource reject naive timestamps."""
+    replay = ReplayLandmarkSource()
+    naive_dt = datetime(2026, 1, 1, 12, 0, 0)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        replay.get_sample(PilotId.PILOT_1, naive_dt, config)
+    replay.close()

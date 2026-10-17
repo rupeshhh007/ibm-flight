@@ -37,10 +37,10 @@ class PilotFrameEvidence:
     frame_id: int | str | None = None
 
     def __post_init__(self) -> None:
-        # Guarantee timezone-aware UTC datetime
+        # Strict timestamp validation: reject naive timestamps per contract
         if self.virtual_time.tzinfo is None or self.virtual_time.utcoffset() is None:
-            object.__setattr__(self, "virtual_time", self.virtual_time.replace(tzinfo=timezone.utc))
-        elif self.virtual_time.tzinfo != timezone.utc:
+            raise ValueError("virtual_time datetime must be timezone-aware")
+        if self.virtual_time.tzinfo != timezone.utc:
             object.__setattr__(self, "virtual_time", self.virtual_time.astimezone(timezone.utc))
 
         # Numeric validation on quality: must be finite and within [0.0, 1.0]
@@ -83,11 +83,28 @@ class PilotEvidenceWindow:
         self._max_samples = max_samples
         self._samples: deque[PilotFrameEvidence] = deque(maxlen=max_samples)
 
+    @staticmethod
+    def _is_usable_barrier(sample: PilotFrameEvidence) -> bool:
+        """
+        Check if a sample is usable or represents an unusable failure barrier.
+        An unusable sample (e.g. camera unavailable, face obscured, invalid geometry,
+        explicitly marked unusable, or error reason present) permanently acts as a failure barrier.
+        """
+        if not sample.is_usable:
+            return False
+        if not sample.camera_available or not sample.face_visible:
+            return False
+        if sample.error_reason is not None:
+            return False
+        if sample.quality <= 0.0:
+            return False
+        return True
+
     def add_sample(self, sample: PilotFrameEvidence) -> None:
-        # Normalize sample virtual_time to UTC
+        # Strict timestamp validation: reject naive timestamps per contract
         if sample.virtual_time.tzinfo is None or sample.virtual_time.utcoffset() is None:
-            sample = replace(sample, virtual_time=sample.virtual_time.replace(tzinfo=timezone.utc))
-        elif sample.virtual_time.tzinfo != timezone.utc:
+            raise ValueError("sample virtual_time datetime must be timezone-aware")
+        if sample.virtual_time.tzinfo != timezone.utc:
             sample = replace(sample, virtual_time=sample.virtual_time.astimezone(timezone.utc))
 
         if self._samples:
@@ -104,6 +121,13 @@ class PilotEvidenceWindow:
 
             # Check for repeated / duplicate timestamp: update in place without inflating sample count
             if sample.virtual_time == last.virtual_time:
+                # If an unusable observation at timestamp T has established a failure barrier,
+                # a subsequent valid sample with the same timestamp must NOT overwrite, remove,
+                # or bypass that barrier.
+                if not self._is_usable_barrier(last):
+                    return
+                # If the existing sample was valid, but this sample is unusable,
+                # the unusable sample establishes the failure barrier.
                 self._samples[-1] = sample
                 return
 
@@ -124,9 +148,8 @@ class PilotEvidenceWindow:
     ) -> PilotObservation:
         # Guarantee timezone-aware UTC virtual timestamp
         if observed_at.tzinfo is None or observed_at.utcoffset() is None:
-            observed_at = observed_at.replace(tzinfo=timezone.utc)
-        else:
-            observed_at = observed_at.astimezone(timezone.utc)
+            raise ValueError("observed_at datetime must be timezone-aware")
+        observed_at = observed_at.astimezone(timezone.utc)
 
         # 1. Filter samples: reject future samples relative to requested observed_at
         eligible = [s for s in self._samples if s.virtual_time <= observed_at]
