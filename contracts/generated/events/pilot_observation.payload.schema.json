@@ -1,0 +1,71 @@
+{
+  "$defs": {
+    "PilotId": {
+      "enum": [
+        "PILOT_1",
+        "PILOT_2"
+      ],
+      "title": "PilotId",
+      "type": "string"
+    },
+    "PilotObservationStatus": {
+      "enum": [
+        "RESPONSIVE",
+        "POSSIBLY_UNRESPONSIVE",
+        "UNKNOWN"
+      ],
+      "title": "PilotObservationStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "camera_available": {
+      "title": "Camera Available",
+      "type": "boolean"
+    },
+    "eyes_closed": {
+      "title": "Eyes Closed",
+      "type": "boolean"
+    },
+    "face_visible": {
+      "title": "Face Visible",
+      "type": "boolean"
+    },
+    "observation_duration_ms": {
+      "maximum": 600000,
+      "minimum": 0,
+      "title": "Observation Duration Ms",
+      "type": "integer"
+    },
+    "observation_quality": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Observation Quality",
+      "type": "number"
+    },
+    "observation_status": {
+      "$ref": "#/$defs/PilotObservationStatus"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "title": "Observed At",
+      "type": "string"
+    },
+    "pilot_id": {
+      "$ref": "#/$defs/PilotId"
+    }
+  },
+  "required": [
+    "pilot_id",
+    "observed_at",
+    "observation_status",
+    "camera_available",
+    "face_visible",
+    "eyes_closed",
+    "observation_duration_ms",
+    "observation_quality"
+  ],
+  "title": "PilotObservation",
+  "type": "object"
+}

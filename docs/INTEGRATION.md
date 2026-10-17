@@ -2,21 +2,39 @@
 
 ## Current readiness
 
-The documentation foundation exists, but the executable P0 foundation does not. Do not create implementation branches from this documentation-only state and call them contract-compatible. Abhinav must first implement canonical source/contracts, mocks, API, event store, generation, and P0 tests; Rupesh must approve the architecture baseline; the team must record the same verified `main` commit SHA.
+The executable P0 foundation is implemented for review on `feat/p0-executable-foundation`, based on `origin/main` commit `3fa3e5eaba1dae270e687ca33d87d2b05d9ccde9`. It includes canonical contracts/Protocols, replaceable mocks, deterministic scenarios, one orchestrator/FastAPI app, SQLite events and command idempotency, generated contracts, safety tests, and smoke tooling. Feature branches must still wait for the P0 PR to be reviewed and merged; the unmerged feature branch is not the shared baseline. Rupesh and Abhinav will announce the verified merged `main` SHA.
 
 ## Foundation and branch creation
 
-1. Complete every P0 launch-gate item in the master specification.
-2. Run and record exact results for `make contracts-check`, backend tests, critical negative tests, and `make smoke`.
-3. Obtain Rupesh's architecture approval and Abhinav's integration sign-off.
-4. Create a local foundation commit only when authorized. Do not publish a remote or create one without authorization.
-5. Share the verified full SHA in team chat and record it in the integration checkpoint log.
+1. Review the `feat/p0-executable-foundation` PR and its exact P0 evidence.
+2. Re-run `make setup`, `make contracts-check`, `make test`, `make check`, and `make smoke` on the PR head.
+3. Obtain Rupesh's architecture approval and Abhinav's integration sign-off; merge through review rather than direct-pushing `main`.
+4. Share the verified merged full SHA in team chat and record it in the integration checkpoint log.
 6. Every developer checks out that same commit, then creates only their assigned branch: `feat/vision`, `feat/simulator`, `feat/guardian`, `feat/sentinel`, `feat/frontend`, or `feat/platform`.
 7. Before editing, read `AGENTS.md`, architecture, contracts, ownership, this guide, and the matching handoff prompt; inspect actual source Protocols and generated schema.
+
+## P0 branch verification record
+
+Local verification on Windows with Python 3.12.5, Node 22.19.0, and npm 10.9.3 (the project declares Python `>=3.11`; CI targets Python 3.11 and Node 20):
+
+| Command/check | Result |
+|---|---|
+| `make PYTHON=python setup` | PASS; repository venv created, pinned backend and npm dependencies installed, npm reported 0 vulnerabilities |
+| `make PYTHON=python contracts` | PASS; live OpenAPI, event JSON Schemas, and TypeScript declaration generated |
+| `make PYTHON=python contracts-check` | PASS; temporary regeneration matched committed artifacts without worktree mutation |
+| Drift comparator stale-fixture test | PASS in `backend/tests/contracts/test_contract_drift.py` |
+| `make PYTHON=python test` | PASS; 26 tests, one third-party Starlette/AnyIO deprecation warning |
+| `make PYTHON=python check` | PASS; drift check, 26 tests, and TypeScript `tsc --noEmit` |
+| `make PYTHON=python smoke` | PASS; 18 ordered events and exactly one `SIM_STABILIZE` action after approval |
+| Real Uvicorn HTTP probe | PASS; `/healthz` returned `ok` and `/api/v1/state` returned the idle typed snapshot |
+
+This evidence applies to the feature-branch working tree and must be rerun on the final pushed head and reviewed PR. GitHub Actions status is not claimed until the PR reports it.
 
 ## Parallel development rules
 
 Developers commit only owned files and tests. Open small PRs when meaningful tests pass. Mocks remain usable so modules can test against stable peers. Public-contract gaps are raised immediately through [Contract Change Protocol](CONTRACT_CHANGE_PROTOCOL.md); they do not become private JSON variants.
+
+To replace a mock, implement the corresponding runtime-checkable Protocol from `backend/app/contracts/interfaces.py`, retain the mock for default tests, add owner-specific tests, and change only composition in `app/main.py` through an Abhinav-reviewed integration PR. Never import another feature module's private implementation.
 
 Coding can proceed concurrently. Practical integration priority is:
 

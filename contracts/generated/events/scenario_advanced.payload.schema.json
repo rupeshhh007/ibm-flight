@@ -1,0 +1,22 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "delta_ms": {
+      "maximum": 600000,
+      "minimum": 1,
+      "title": "Delta Ms",
+      "type": "integer"
+    },
+    "virtual_time": {
+      "format": "date-time",
+      "title": "Virtual Time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "delta_ms",
+    "virtual_time"
+  ],
+  "title": "ScenarioAdvancedPayload",
+  "type": "object"
+}

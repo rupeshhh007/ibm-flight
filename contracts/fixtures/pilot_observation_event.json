@@ -1,0 +1,20 @@
+{
+  "event_id": "11111111-1111-4111-8111-111111111111",
+  "schema_version": "1.0",
+  "event_type": "PILOT_OBSERVATION",
+  "occurred_at": "2026-01-01T00:00:01Z",
+  "source": "VISION",
+  "scenario_run_id": "22222222-2222-4222-8222-222222222222",
+  "correlation_id": "33333333-3333-4333-8333-333333333333",
+  "causation_event_id": null,
+  "payload": {
+    "pilot_id": "PILOT_1",
+    "observed_at": "2026-01-01T00:00:01Z",
+    "observation_status": "RESPONSIVE",
+    "camera_available": true,
+    "face_visible": true,
+    "eyes_closed": false,
+    "observation_duration_ms": 1000,
+    "observation_quality": 0.98
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "scenario_id": {
+      "title": "Scenario Id",
+      "type": "string"
+    },
+    "started_at": {
+      "format": "date-time",
+      "title": "Started At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "scenario_id",
+    "started_at"
+  ],
+  "title": "ScenarioStartedPayload",
+  "type": "object"
+}
