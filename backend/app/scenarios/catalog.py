@@ -70,11 +70,16 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
 
 
 def list_scenarios() -> list[ScenarioMetadata]:
-    return [definition.metadata for definition in SCENARIOS.values()]
+    return [definition.metadata.model_copy(deep=True) for definition in SCENARIOS.values()]
 
 
 def get_scenario(scenario_id: str) -> ScenarioDefinition:
     try:
-        return SCENARIOS[scenario_id]
+        definition = SCENARIOS[scenario_id]
     except KeyError as exc:
         raise ValueError(f"unknown scenario_id: {scenario_id}") from exc
+    return ScenarioDefinition(
+        metadata=definition.metadata.model_copy(deep=True),
+        atc_connected=definition.atc_connected,
+        observation_schedule=definition.observation_schedule,
+    )
