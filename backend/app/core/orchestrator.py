@@ -493,6 +493,24 @@ class Orchestrator:
             fingerprint = self._fingerprint(request)
             if existing := self._existing(request.command_id, fingerprint):
                 return existing
+
+            # Reconnect is only a delivery opportunity, never an authorization.
+            # Preserve proof that the incident was already admitted to Sentinel
+            # before refreshing the (possibly stale) platform snapshot.
+            was_connected = self._snapshot.communication.atc_link_connected
+            guardian_incident = self.guardian.active_incident
+            replay_incident = (
+                guardian_incident
+                if request.atc_link_connected
+                and not was_connected
+                and self.sentinel.state == SentinelState.STANDBY
+                and self.guardian.state == GuardianState.ESCALATED
+                and guardian_incident is not None
+                and self._snapshot.active_incident == guardian_incident
+                and self._sentinel_admitted_incident_id == guardian_incident.incident_id
+                else None
+            )
+
             self.sentinel.set_atc_link(request.scenario_run_id, request.atc_link_connected)
             payload = ATCLinkChangedPayload(
                 command_id=request.command_id,
@@ -513,11 +531,41 @@ class Orchestrator:
             self._snapshot.communication = self._snapshot.communication.model_copy(
                 update={"atc_link_connected": request.atc_link_connected, "last_change_at": request.changed_at}
             )
+            # A retired incident must stay retired even if Sentinel still holds
+            # its old local incident. No stale/unsynchronized episode is replayed.
+            self._refresh_guardian_snapshot()
+            redelivery_rejected = False
+            if replay_incident is not None:
+                # Re-deliver the *same* authorized handoff as a new pending
+                # decision. The frozen Sentinel Protocol intentionally has no
+                # direct reconnect-resume method; on_incident is its safe gate.
+                try:
+                    pending = self.sentinel.on_incident(replay_incident, self.clock.now())
+                except ValueError:
+                    # The link change is already durable. Record its command
+                    # result rather than failing the request after a side effect.
+                    # The invariant remains fail-closed: no handoff, no approval.
+                    redelivery_rejected = True
+                else:
+                    stored.extend(self._commit([
+                        self._event(
+                            EventType.SENTINEL_DECISION,
+                            EventSource.SENTINEL,
+                            request.scenario_run_id,
+                            request.command_id,
+                            pending,
+                            stored[0].event_id,
+                        )
+                    ]))
             self._snapshot.sentinel_state = self.sentinel.state
             response = CommandResponse(
                 command_id=request.command_id,
                 accepted=True,
-                message="Simulated ATC link updated; link state alone authorizes no action",
+                message=(
+                    "Simulated ATC link updated; incident redelivery rejected; no action authorized"
+                    if redelivery_rejected
+                    else "Simulated ATC link updated; link state alone authorizes no action"
+                ),
                 snapshot=self.snapshot,
                 events=stored,
             )
