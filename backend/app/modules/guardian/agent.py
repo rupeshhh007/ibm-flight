@@ -47,7 +47,7 @@ class _PilotEvidence:
     latest_usable: bool = False
     latest_responsive_at: datetime | None = None
     unknown_streak: int = 0
-    recovery_responses: int = 0
+    recovery_responses: deque[datetime] = field(default_factory=deque)
 
 
 _ALLOWED_TRANSITIONS: dict[GuardianState, set[GuardianState]] = {
@@ -89,10 +89,11 @@ class DeterministicGuardianAgent:
         self._processed_ids: deque[UUID] = deque()
         self._processed_id_set: set[UUID] = set()
         self._acknowledgement_ids: deque[UUID] = deque()
-        self._acknowledgement_id_set: set[UUID] = set()
+        self._acknowledgements: dict[UUID, PilotAcknowledgement] = {}
         self._last_seq: int | None = None
         self._last_event_time: datetime | None = None
         self._episode_started_at: datetime | None = None
+        self._recovery_started_at: datetime | None = None
         self._last_transition_reason = GuardianReason.RESET
 
     @property
@@ -119,10 +120,11 @@ class DeterministicGuardianAgent:
         self._processed_ids.clear()
         self._processed_id_set.clear()
         self._acknowledgement_ids.clear()
-        self._acknowledgement_id_set.clear()
+        self._acknowledgements.clear()
         self._last_seq = None
         self._last_event_time = None
         self._episode_started_at = None
+        self._recovery_started_at = None
         self._last_transition_reason = GuardianReason.RESET
 
     def consume_observation(self, event: StoredEvent) -> GuardianIncident | None:
@@ -167,10 +169,9 @@ class DeterministicGuardianAgent:
             self._reconcile_non_escalated_state()
             return None
 
-        self._transition(GuardianState.ESCALATED, GuardianReason.DUAL_FRESH_EVIDENCE)
         evidence = self._incident_evidence()
         incident_name = "guardian:" + ":".join(str(item.event_id) for item in evidence)
-        self._active_incident = GuardianIncident(
+        incident = GuardianIncident(
             incident_id=uuid5(event.scenario_run_id, incident_name),
             scenario_run_id=event.scenario_run_id,
             incident_type=IncidentType.DUAL_PILOT_UNRESPONSIVE,
@@ -180,7 +181,7 @@ class DeterministicGuardianAgent:
             explanation=(
                 "Rule G-DET-1: both pilots have at least "
                 f"{self.policy.concerns_required_per_pilot} distinct usable concern observations "
-                f"(quality >= {self.policy.minimum_observation_quality:.2f}, spacing >= "
+                f"(quality >= {_format_quality(self.policy.minimum_observation_quality)}, spacing >= "
                 f"{self.policy.minimum_independent_spacing_ms} ms) within "
                 f"{self.policy.evidence_window_ms} ms; no latest usable pilot observation is responsive, "
                 f"and the {self.policy.acknowledgement_grace_ms} ms event-time grace elapsed."
@@ -188,23 +189,31 @@ class DeterministicGuardianAgent:
             acknowledgement_required=True,
             created_at=event.occurred_at,
         )
-        return self._active_incident
+        self._transition(GuardianState.ESCALATED, GuardianReason.DUAL_FRESH_EVIDENCE)
+        self._active_incident = incident
+        self._reset_recovery_evidence(event.occurred_at)
+        return incident
 
     def acknowledge(self, acknowledgement: PilotAcknowledgement) -> None:
         if self._run_id is None or acknowledgement.scenario_run_id != self._run_id:
             raise ValueError("Guardian rejected stale scenario_run_id")
-        if acknowledgement.command_id in self._acknowledgement_id_set:
-            return
+        previous = self._acknowledgements.get(acknowledgement.command_id)
+        if previous is not None:
+            if previous == acknowledgement:
+                return
+            raise ValueError("Guardian rejected conflicting acknowledgement command_id")
+        if self._active_incident is None:
+            raise ValueError("Guardian rejected acknowledgement with no active incident")
+        if acknowledgement.alert_id != self._active_incident.incident_id:
+            raise ValueError("Guardian rejected acknowledgement for a different incident")
         if self._last_event_time is not None and acknowledgement.acknowledged_at < self._last_event_time:
             raise ValueError("Guardian rejected acknowledgement older than current evidence")
-        if self._active_incident is not None and acknowledgement.alert_id != self._active_incident.incident_id:
-            raise ValueError("Guardian rejected acknowledgement for a different incident")
 
-        self._remember_acknowledgement(acknowledgement.command_id)
+        self._remember_acknowledgement(acknowledgement)
         self._active_incident = None
         self._clear_concerns()
+        self._reset_recovery_evidence(acknowledgement.acknowledged_at)
         for pilot in self._pilots.values():
-            pilot.recovery_responses = 0
             # Recovery requires new post-acknowledgement evidence. Do not let
             # the pre-acknowledgement concern status restart recovery counters.
             pilot.latest_status = None
@@ -231,9 +240,10 @@ class DeterministicGuardianAgent:
 
     def _consume_concern(self, pilot: _PilotEvidence, event: StoredEvent) -> None:
         if self._state == GuardianState.RECOVERING:
-            for item in self._pilots.values():
-                item.recovery_responses = 0
+            self._reset_recovery_evidence(None)
             self._transition(GuardianState.SUSPECTED, GuardianReason.NEW_CONCERN_DURING_RECOVERY)
+        elif self._state == GuardianState.ESCALATED:
+            self._reset_recovery_evidence(event.occurred_at)
         last = pilot.concerns[-1] if pilot.concerns else None
         spacing = timedelta(milliseconds=self.policy.minimum_independent_spacing_ms)
         if last is None or event.occurred_at - last.observed_at >= spacing:
@@ -251,21 +261,26 @@ class DeterministicGuardianAgent:
     ) -> None:
         had_concern = bool(pilot.concerns) or previous_status == PilotObservationStatus.POSSIBLY_UNRESPONSIVE
         pilot.concerns.clear()
+        self._recompute_episode_start()
         pilot.latest_responsive_at = observed_at
         if self._state == GuardianState.ESCALATED:
+            self._record_recovery_response(pilot, observed_at)
+            if self._recovery_threshold_met():
+                self._active_incident = None
+                self._clear_concerns()
+                self._transition(GuardianState.RECOVERING, GuardianReason.CONCERN_RESOLVING)
+                self._reset_recovery_evidence(observed_at)
             return
         if had_concern and self._state != GuardianState.NORMAL:
             self._transition(GuardianState.RECOVERING, GuardianReason.CONCERN_RESOLVING)
-            for item in self._pilots.values():
-                item.recovery_responses = 0
+            self._reset_recovery_evidence(observed_at)
+            return
         if self._state == GuardianState.RECOVERING:
-            pilot.recovery_responses += 1
-            if all(
-                item.recovery_responses >= self.policy.recovery_observations_required_per_pilot
-                for item in self._pilots.values()
-            ):
+            self._record_recovery_response(pilot, observed_at)
+            if self._recovery_threshold_met():
                 self._transition(GuardianState.NORMAL, GuardianReason.RECOVERY_COMPLETE)
-                self._episode_started_at = None
+                self._clear_concerns()
+                self._reset_recovery_evidence(None)
             return
         self._reconcile_non_escalated_state()
 
@@ -274,6 +289,9 @@ class DeterministicGuardianAgent:
         for pilot in self._pilots.values():
             while pilot.concerns and pilot.concerns[0].observed_at < cutoff:
                 pilot.concerns.popleft()
+            while pilot.recovery_responses and pilot.recovery_responses[0] < cutoff:
+                pilot.recovery_responses.popleft()
+        self._recompute_episode_start()
 
     def _can_escalate(self, now: datetime) -> bool:
         if self._state == GuardianState.ESCALATED or self._episode_started_at is None:
@@ -323,14 +341,52 @@ class DeterministicGuardianAgent:
             pilot.concerns.clear()
         self._episode_started_at = None
 
+    def _recompute_episode_start(self) -> None:
+        remaining = [evidence.observed_at for pilot in self._pilots.values() for evidence in pilot.concerns]
+        self._episode_started_at = min(remaining, default=None)
+
+    def _reset_recovery_evidence(self, boundary: datetime | None) -> None:
+        self._recovery_started_at = boundary
+        for pilot in self._pilots.values():
+            pilot.recovery_responses.clear()
+
+    def _record_recovery_response(self, pilot: _PilotEvidence, observed_at: datetime) -> None:
+        if self._recovery_started_at is None or observed_at <= self._recovery_started_at:
+            return
+        spacing = timedelta(milliseconds=self.policy.minimum_independent_spacing_ms)
+        if pilot.recovery_responses and observed_at - pilot.recovery_responses[-1] < spacing:
+            return
+        pilot.recovery_responses.append(observed_at)
+        while len(pilot.recovery_responses) > self.policy.recovery_observations_required_per_pilot:
+            pilot.recovery_responses.popleft()
+
+    def _recovery_threshold_met(self) -> bool:
+        return all(
+            pilot.latest_usable
+            and pilot.latest_status == PilotObservationStatus.RESPONSIVE
+            and len(pilot.recovery_responses) >= self.policy.recovery_observations_required_per_pilot
+            for pilot in self._pilots.values()
+        )
+
     def _remember_event(self, event_id: UUID) -> None:
         self._processed_ids.append(event_id)
         self._processed_id_set.add(event_id)
         while len(self._processed_ids) > self.policy.max_processed_events:
             self._processed_id_set.remove(self._processed_ids.popleft())
 
-    def _remember_acknowledgement(self, command_id: UUID) -> None:
+    def _remember_acknowledgement(self, acknowledgement: PilotAcknowledgement) -> None:
+        command_id = acknowledgement.command_id
         self._acknowledgement_ids.append(command_id)
-        self._acknowledgement_id_set.add(command_id)
+        self._acknowledgements[command_id] = acknowledgement
         while len(self._acknowledgement_ids) > self.policy.max_acknowledgements:
-            self._acknowledgement_id_set.remove(self._acknowledgement_ids.popleft())
+            self._acknowledgements.pop(self._acknowledgement_ids.popleft(), None)
+
+
+def _format_quality(value: float) -> str:
+    text = str(value)
+    if "e" in text.lower():
+        return text
+    if "." not in text:
+        return f"{text}.00"
+    whole, fraction = text.split(".", maxsplit=1)
+    return f"{whole}.{fraction.ljust(2, '0')}"

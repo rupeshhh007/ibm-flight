@@ -67,13 +67,14 @@ def acknowledgement(
     *,
     command_id: UUID = UUID("30000000-0000-4000-8000-000000000003"),
     run_id: UUID = RUN_ID,
+    acknowledged_at_ms: int = 1_000,
 ) -> PilotAcknowledgement:
     return PilotAcknowledgement(
         command_id=command_id,
         scenario_run_id=run_id,
         pilot_id=PilotId.PILOT_1,
         alert_id=alert_id,
-        acknowledged_at=BASE_TIME + timedelta(seconds=3),
+        acknowledged_at=BASE_TIME + timedelta(milliseconds=acknowledged_at_ms),
     )
 
 
@@ -254,6 +255,54 @@ def test_expired_concerns_do_not_combine_into_incident() -> None:
     assert agent.active_incident is None
 
 
+def test_new_episode_receives_full_grace_after_all_old_evidence_expires() -> None:
+    policy = GuardianPolicy(evidence_window_ms=1_000, acknowledgement_grace_ms=1_000)
+    agent = new_agent(policy)
+    agent.consume_observation(
+        observation_event(1, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=0)
+    )
+    agent.consume_observation(
+        observation_event(2, PilotId.PILOT_2, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=0)
+    )
+
+    # At 1,001 ms all old evidence has expired. The fresh episode starts here.
+    agent.consume_observation(
+        observation_event(3, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=1_001)
+    )
+    agent.consume_observation(
+        observation_event(4, PilotId.PILOT_2, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=1_001)
+    )
+    agent.consume_observation(
+        observation_event(5, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=1_501)
+    )
+    assert agent.consume_observation(
+        observation_event(6, PilotId.PILOT_2, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=1_501)
+    ) is None
+    assert agent.active_incident is None
+
+    # Exactly at the new episode's 1,000 ms grace boundary escalation is allowed.
+    incident = agent.consume_observation(
+        observation_event(7, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=2_001)
+    )
+    assert incident is not None
+    assert incident.created_at == BASE_TIME + timedelta(milliseconds=2_001)
+
+
+@pytest.mark.parametrize(("at_ms", "expired"), [(999, False), (1_000, False), (1_001, True)])
+def test_evidence_window_expiry_boundary_is_inclusive(at_ms: int, expired: bool) -> None:
+    policy = GuardianPolicy(evidence_window_ms=1_000, acknowledgement_grace_ms=1_000)
+    agent = new_agent(policy)
+    agent.consume_observation(
+        observation_event(1, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=0)
+    )
+    agent.consume_observation(
+        observation_event(2, PilotId.PILOT_2, PilotObservationStatus.UNKNOWN, at_ms=at_ms)
+    )
+    retained = len(agent._pilots[PilotId.PILOT_1].concerns)
+    assert retained == (0 if expired else 1)
+    assert (agent._episode_started_at is None) is expired
+
+
 def test_processing_order_within_round_does_not_change_safety_outcome() -> None:
     evidence_sets = []
     for order in ((PilotId.PILOT_1, PilotId.PILOT_2), (PilotId.PILOT_2, PilotId.PILOT_1)):
@@ -300,6 +349,34 @@ def test_matching_acknowledgement_recovers_and_duplicate_is_idempotent() -> None
     assert agent.state == GuardianState.RECOVERING
 
 
+@pytest.mark.parametrize("target_state", [GuardianState.NORMAL, GuardianState.SUSPECTED, GuardianState.AWAITING_ACK])
+def test_acknowledgement_without_active_incident_is_rejected_without_mutation(target_state: GuardianState) -> None:
+    agent = new_agent()
+    if target_state in {GuardianState.SUSPECTED, GuardianState.AWAITING_ACK}:
+        agent.consume_observation(
+            observation_event(1, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=0)
+        )
+    if target_state == GuardianState.AWAITING_ACK:
+        agent.consume_observation(
+            observation_event(2, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=500)
+        )
+    before = (
+        agent.state,
+        agent.active_incident,
+        agent.last_transition_reason,
+        tuple((pilot_id, tuple(item.concerns)) for pilot_id, item in agent._pilots.items()),
+    )
+    with pytest.raises(ValueError, match="no active incident"):
+        agent.acknowledge(acknowledgement(UUID(int=999), acknowledged_at_ms=500))
+    after = (
+        agent.state,
+        agent.active_incident,
+        agent.last_transition_reason,
+        tuple((pilot_id, tuple(item.concerns)) for pilot_id, item in agent._pilots.items()),
+    )
+    assert after == before
+
+
 def test_stale_or_wrong_acknowledgement_is_rejected_without_clearing_incident() -> None:
     agent = new_agent()
     incident, _ = escalate(agent)
@@ -330,6 +407,164 @@ def test_recovery_requires_fresh_responses_from_both_pilots() -> None:
             agent.consume_observation(observation_event(seq, pilot, PilotObservationStatus.RESPONSIVE, at_ms=at_ms))
             seq += 1
     assert agent.state == GuardianState.NORMAL
+
+
+def test_escalated_incident_requires_dual_fresh_response_then_new_evidence_to_normal() -> None:
+    agent = new_agent()
+    incident, _ = escalate(agent)
+
+    seq = 5
+    for at_ms in (2_000, 3_000):
+        for pilot in PilotId:
+            agent.consume_observation(observation_event(seq, pilot, PilotObservationStatus.RESPONSIVE, at_ms=at_ms))
+            seq += 1
+
+    assert agent.state == GuardianState.RECOVERING
+    assert agent.active_incident is None
+    assert incident.incident_id is not None
+
+    # The evidence that invalidated the incident is not reused to reach NORMAL.
+    for at_ms in (4_000, 5_000):
+        for pilot in PilotId:
+            agent.consume_observation(observation_event(seq, pilot, PilotObservationStatus.RESPONSIVE, at_ms=at_ms))
+            seq += 1
+    assert agent.state == GuardianState.NORMAL
+
+
+def test_one_pilot_or_insufficient_responses_do_not_clear_escalated_incident() -> None:
+    agent = new_agent()
+    incident, _ = escalate(agent)
+    agent.consume_observation(
+        observation_event(5, PilotId.PILOT_1, PilotObservationStatus.RESPONSIVE, at_ms=2_000)
+    )
+    agent.consume_observation(
+        observation_event(6, PilotId.PILOT_1, PilotObservationStatus.RESPONSIVE, at_ms=3_000)
+    )
+    agent.consume_observation(
+        observation_event(7, PilotId.PILOT_2, PilotObservationStatus.RESPONSIVE, at_ms=3_000)
+    )
+    assert agent.state == GuardianState.ESCALATED
+    assert agent.active_incident == incident
+
+
+def test_unknown_low_quality_and_duplicate_frames_do_not_clear_escalated_incident() -> None:
+    agent = new_agent()
+    incident, _ = escalate(agent)
+    unknown = observation_event(
+        5,
+        PilotId.PILOT_1,
+        PilotObservationStatus.UNKNOWN,
+        at_ms=2_000,
+        quality=0.0,
+        camera_available=False,
+        face_visible=False,
+    )
+    agent.consume_observation(unknown)
+    agent.consume_observation(unknown)
+    agent.consume_observation(
+        observation_event(6, PilotId.PILOT_2, PilotObservationStatus.RESPONSIVE, at_ms=2_000, quality=0.79)
+    )
+    assert agent.state == GuardianState.ESCALATED
+    assert agent.active_incident == incident
+
+
+def test_latest_unknown_blocks_older_responsive_evidence_from_clearing_incident() -> None:
+    agent = new_agent()
+    incident, _ = escalate(agent)
+    agent.consume_observation(
+        observation_event(5, PilotId.PILOT_1, PilotObservationStatus.RESPONSIVE, at_ms=2_000)
+    )
+    agent.consume_observation(
+        observation_event(6, PilotId.PILOT_2, PilotObservationStatus.RESPONSIVE, at_ms=2_000)
+    )
+    agent.consume_observation(
+        observation_event(7, PilotId.PILOT_1, PilotObservationStatus.RESPONSIVE, at_ms=3_000)
+    )
+    agent.consume_observation(
+        observation_event(
+            8,
+            PilotId.PILOT_1,
+            PilotObservationStatus.UNKNOWN,
+            at_ms=3_500,
+            quality=0.0,
+            camera_available=False,
+            face_visible=False,
+        )
+    )
+    agent.consume_observation(
+        observation_event(9, PilotId.PILOT_2, PilotObservationStatus.RESPONSIVE, at_ms=3_500)
+    )
+    assert agent.state == GuardianState.ESCALATED
+    assert agent.active_incident == incident
+
+
+def test_fresh_concern_resets_escalated_recovery_evidence() -> None:
+    agent = new_agent()
+    incident, _ = escalate(agent)
+    agent.consume_observation(
+        observation_event(5, PilotId.PILOT_1, PilotObservationStatus.RESPONSIVE, at_ms=2_000)
+    )
+    agent.consume_observation(
+        observation_event(6, PilotId.PILOT_2, PilotObservationStatus.RESPONSIVE, at_ms=2_000)
+    )
+    agent.consume_observation(
+        observation_event(7, PilotId.PILOT_1, PilotObservationStatus.POSSIBLY_UNRESPONSIVE, at_ms=3_000)
+    )
+    agent.consume_observation(
+        observation_event(8, PilotId.PILOT_1, PilotObservationStatus.RESPONSIVE, at_ms=4_000)
+    )
+    agent.consume_observation(
+        observation_event(9, PilotId.PILOT_2, PilotObservationStatus.RESPONSIVE, at_ms=4_000)
+    )
+    assert agent.state == GuardianState.ESCALATED
+    assert agent.active_incident == incident
+
+
+def test_recovery_observations_must_be_strictly_after_acknowledgement() -> None:
+    agent = new_agent()
+    incident, _ = escalate(agent)
+    agent.acknowledge(acknowledgement(incident.incident_id, acknowledged_at_ms=3_000))
+    seq = 5
+    for at_ms in (2_999, 3_000, 3_001):
+        for pilot in PilotId:
+            agent.consume_observation(observation_event(seq, pilot, PilotObservationStatus.RESPONSIVE, at_ms=at_ms))
+            seq += 1
+    assert agent.state == GuardianState.RECOVERING
+    for pilot in PilotId:
+        agent.consume_observation(
+            observation_event(seq, pilot, PilotObservationStatus.RESPONSIVE, at_ms=3_501)
+        )
+        seq += 1
+    assert agent.state == GuardianState.NORMAL
+
+
+def test_new_concern_after_incident_recovery_starts_with_new_evidence() -> None:
+    agent = new_agent()
+    first_incident, _ = escalate(agent)
+    seq = 5
+    for at_ms in (2_000, 3_000):
+        for pilot in PilotId:
+            agent.consume_observation(observation_event(seq, pilot, PilotObservationStatus.RESPONSIVE, at_ms=at_ms))
+            seq += 1
+    assert agent.state == GuardianState.RECOVERING
+
+    second_evidence: set[UUID] = set()
+    second_incident = None
+    for at_ms in (4_000, 5_000):
+        for pilot in PilotId:
+            event = observation_event(
+                seq,
+                pilot,
+                PilotObservationStatus.POSSIBLY_UNRESPONSIVE,
+                at_ms=at_ms,
+            )
+            second_evidence.add(event.event_id)
+            second_incident = agent.consume_observation(event) or second_incident
+            seq += 1
+    assert second_incident is not None
+    assert second_incident.incident_id != first_incident.incident_id
+    assert set(second_incident.evidence_event_ids) == second_evidence
+    assert set(second_incident.evidence_event_ids).isdisjoint(first_incident.evidence_event_ids)
 
 
 def test_new_concern_during_recovery_starts_a_new_episode() -> None:
@@ -398,14 +633,58 @@ def test_quality_and_spacing_boundaries_are_inclusive() -> None:
     assert agent.state == GuardianState.AWAITING_ACK
 
 
+@pytest.mark.parametrize(("threshold", "expected"), [(0.80, "0.80"), (0.805, "0.805")])
+def test_incident_explanation_preserves_quality_threshold(threshold: float, expected: str) -> None:
+    agent = new_agent(GuardianPolicy(minimum_observation_quality=threshold))
+    incident = None
+    seq = 1
+    for at_ms in (0, 1_000):
+        for pilot in PilotId:
+            incident = agent.consume_observation(
+                observation_event(
+                    seq,
+                    pilot,
+                    PilotObservationStatus.POSSIBLY_UNRESPONSIVE,
+                    at_ms=at_ms,
+                    quality=threshold,
+                )
+            ) or incident
+            seq += 1
+    assert incident is not None
+    assert f"quality >= {expected}" in incident.explanation
+
+
+def test_evidence_below_high_precision_quality_threshold_does_not_count() -> None:
+    agent = new_agent(GuardianPolicy(minimum_observation_quality=0.805))
+    for seq, pilot in enumerate(PilotId, start=1):
+        agent.consume_observation(
+            observation_event(
+                seq,
+                pilot,
+                PilotObservationStatus.POSSIBLY_UNRESPONSIVE,
+                at_ms=0,
+                quality=0.804,
+            )
+        )
+    assert agent.state == GuardianState.NORMAL
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
         {"minimum_observation_quality": -0.01},
         {"minimum_observation_quality": 1.01},
+        {"minimum_observation_quality": float("nan")},
+        {"minimum_observation_quality": float("inf")},
+        {"minimum_observation_quality": True},
+        {"minimum_observation_quality": "0.8"},
         {"minimum_independent_spacing_ms": 0},
+        {"minimum_independent_spacing_ms": 500.5},
+        {"minimum_independent_spacing_ms": True},
         {"evidence_window_ms": 0},
+        {"evidence_window_ms": 1.5},
         {"concerns_required_per_pilot": 1},
+        {"concerns_required_per_pilot": 2.5},
         {"concerns_required_per_pilot": 33, "max_evidence_per_pilot": 33},
         {"awaiting_ack_concerns": 1},
         {"acknowledgement_grace_ms": -1},
@@ -424,6 +703,14 @@ def test_quality_and_spacing_boundaries_are_inclusive() -> None:
 def test_invalid_policy_is_rejected(kwargs: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         GuardianPolicy(**kwargs)
+
+
+def test_rejected_invalid_policy_does_not_mutate_existing_agent() -> None:
+    agent = new_agent()
+    before = (agent.state, agent.active_incident, agent.retained_event_count)
+    with pytest.raises(ValueError):
+        GuardianPolicy(concerns_required_per_pilot=2.5)  # type: ignore[arg-type]
+    assert (agent.state, agent.active_incident, agent.retained_event_count) == before
 
 
 def test_processed_event_retention_is_bounded() -> None:

@@ -22,4 +22,13 @@ the API safety, contract, and smoke suites.
 Contract-v1 limitations remain outside this module: Guardian receives no
 telemetry or timer events, the API does not deliver early single-pilot
 acknowledgements, and the orchestrator does not refresh a cleared incident
-snapshot after observation-driven recovery.
+snapshot or invalidate Sentinel authorization after observation-driven
+recovery. Until the platform owner implements and tests that propagation, a
+stale approval may still refer to the orchestrator's old incident snapshot.
+
+Accepted acknowledgements establish an event-time recovery boundary. Only
+usable observations strictly newer than `acknowledged_at` count toward
+recovery. If an API acknowledgement uses wall-clock time ahead of the virtual
+scenario clock, recovery intentionally waits until virtual observations pass
+that boundary; the platform integration should normalize or validate those
+clock domains explicitly.
