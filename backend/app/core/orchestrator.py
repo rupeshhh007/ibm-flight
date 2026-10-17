@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from datetime import timezone
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
@@ -166,11 +167,13 @@ class Orchestrator:
         correlation_id: UUID,
         payload: BaseModel,
         causation_event_id: UUID | None = None,
+        *,
+        occurred_at: datetime | None = None,
     ) -> DomainEvent:
         return DomainEvent(
             event_id=uuid4(),
             event_type=event_type,
-            occurred_at=self.clock.now().astimezone(timezone.utc),
+            occurred_at=(occurred_at if occurred_at is not None else self.clock.now()).astimezone(timezone.utc),
             source=source,
             scenario_run_id=scenario_run_id,
             correlation_id=correlation_id,
@@ -252,6 +255,32 @@ class Orchestrator:
                 raise DomainError("NO_SCENARIO_RUNNER", "active scenario runner is unavailable", 500)
             now = self.clock.advance(request.delta_ms)
             due_pilots = self._runner.advance(request.delta_ms)
+            end_elapsed_ms = self._runner.elapsed_ms
+            begin_elapsed_ms = end_elapsed_ms - request.delta_ms
+
+            # ScenarioRunner currently returns pilot IDs without their scheduled
+            # offsets. Resolve offsets from its own immutable scenario definition;
+            # never stamp a due observation with the batch's final clock time.
+            # Keep this adapter inside platform until Rohan adds an owned timed
+            # runner API. No public contract or scenario code is changed here.
+            due_times: dict[PilotId, deque[datetime]] = defaultdict(deque)
+            for scheduled_ms, pilot_id in sorted(
+                self._runner.definition.observation_schedule, key=lambda entry: entry[0]
+            ):
+                if begin_elapsed_ms < scheduled_ms <= end_elapsed_ms:
+                    due_times[pilot_id].append(
+                        now - timedelta(milliseconds=end_elapsed_ms - scheduled_ms)
+                    )
+            scheduled_observations: list[tuple[datetime, PilotId]] = []
+            for pilot_id in due_pilots:
+                # An injected test runner may supply unscheduled observations.
+                # Preserve its old virtual-now behavior without changing the
+                # production runner's existing public return type.
+                timestamps = due_times[pilot_id]
+                observed_at = timestamps.popleft() if timestamps else now
+                scheduled_observations.append((observed_at, pilot_id))
+            scheduled_observations.sort(key=lambda entry: entry[0])
+
             telemetry = self.simulator.advance(request.scenario_run_id, now)
             base_events: list[DomainEvent] = [
                 self._event(
@@ -270,8 +299,8 @@ class Orchestrator:
                 ),
             ]
             observations = []
-            for pilot_id in due_pilots:
-                observation = self.vision.observe(pilot_id, now)
+            for observed_at, pilot_id in scheduled_observations:
+                observation = self.vision.observe(pilot_id, observed_at)
                 observations.append(observation)
                 base_events.append(
                     self._event(
@@ -280,6 +309,7 @@ class Orchestrator:
                         request.scenario_run_id,
                         request.command_id,
                         observation,
+                        occurred_at=observed_at,
                     )
                 )
             committed = self._commit(base_events)
@@ -301,12 +331,13 @@ class Orchestrator:
                         request.command_id,
                         incident,
                         event.event_id,
+                        occurred_at=event.occurred_at,
                     )
                     incident_stored = self._commit([incident_event])
                     derived.extend(incident_stored)
                     self._incidents.append(incident)
                     self._snapshot.active_incident = incident
-                    sentinel_decision = self.sentinel.on_incident(incident, now)
+                    sentinel_decision = self.sentinel.on_incident(incident, event.occurred_at)
                     self._sentinel_admitted_incident_id = incident.incident_id
                     derived.extend(
                         self._commit(
@@ -318,6 +349,7 @@ class Orchestrator:
                                     request.command_id,
                                     sentinel_decision,
                                     incident_stored[-1].event_id,
+                                    occurred_at=event.occurred_at,
                                 )
                             ]
                         )
