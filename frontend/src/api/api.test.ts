@@ -75,5 +75,57 @@ describe("api client", () => {
     const error = await api.state().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).isNetworkError).toBe(true);
+    expect((error as ApiError).isUncertain).toBe(true);
+  });
+
+  it("times out stalled requests after timeoutMs and raises TIMEOUT_ERROR", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(
+        (_path, init?: RequestInit) =>
+          new Promise((_, reject) => {
+            if (init?.signal) {
+              init.signal.addEventListener("abort", () => {
+                reject(new DOMException("The user aborted a request.", "AbortError"));
+              });
+            }
+          }),
+      ),
+    );
+    const error = await api.state({ timeoutMs: 30 }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("TIMEOUT_ERROR");
+    expect((error as ApiError).isTimeout).toBe(true);
+    expect((error as ApiError).isUncertain).toBe(true);
+  });
+
+  it("classifies response-body streaming failure as UNCERTAIN_TRANSPORT_ERROR", async () => {
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      text: () => Promise.reject(new Error("Connection reset by peer while streaming response")),
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse));
+    const error = await api.state().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("UNCERTAIN_TRANSPORT_ERROR");
+    expect((error as ApiError).isUncertain).toBe(true);
+  });
+
+  it("distinguishes confirmed backend rejections from transport errors", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ code: "AUTHORIZATION_REJECTED", message: "Rejected by Sentinel", details: ["pilot responsive"] }),
+          { status: 409 },
+        ),
+      ),
+    );
+    const error = await api.state().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("AUTHORIZATION_REJECTED");
+    expect((error as ApiError).isUncertain).toBe(false);
+    expect((error as ApiError).status).toBe(409);
   });
 });

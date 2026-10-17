@@ -10,7 +10,7 @@
 //   3. The UI never shows success before the backend's CommandResponse confirms it.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api as defaultApi, ApiError, newCommandId, type Api } from "../api/client";
-import { latestSeq, mergeEvents } from "../api/events";
+import { mergeEvents } from "../api/events";
 import type {
   ATCDecisionType,
   CommandResponse,
@@ -28,12 +28,12 @@ export type Connection = "connecting" | "online" | "offline";
 
 export interface CommandOutcome {
   label: string;
-  status: "accepted" | "duplicate" | "rejected" | "network";
+  status: "accepted" | "duplicate" | "rejected" | "network" | "uncertain";
   message: string;
   code?: string;
   details?: string[];
   at: number;
-  /** Present for network failures: resends the SAME body (same command_id), so a retry is idempotent. */
+  /** Present for network or uncertain transport failures: resends the SAME body (same command_id), so a retry is idempotent. */
   retry?: () => void;
 }
 
@@ -98,15 +98,39 @@ export function AeroGuardProvider({ children, client = defaultApi, pollMs = POLL
   // re-creating callbacks (avoids stale closures carrying an old run ID).
   const snapshotRef = useRef<SystemSnapshot | null>(null);
   const eventsRef = useRef<StoredEvent[]>([]);
+  // Dedicated history pagination cursor tracking the sequential history seq fetched
+  // from client.events. Never advanced by command responses or out-of-order events.
+  const historyCursorRef = useRef<number>(0);
   const pendingRef = useRef<string | null>(null);
   // Bumped whenever a command starts or finishes, so a poll can tell whether a
   // command overlapped it (and its snapshot might therefore be outdated).
   const commandEpochRef = useRef(0);
+  // Monotonically increasing identifier for active command executions to prevent late
+  // responses from timed-out or cancelled requests from overwriting state or clearing locks.
+  const commandGenerationRef = useRef(0);
+  // Request sequence generator for refresh calls to reject superseded responses.
+  const refreshSeqRef = useRef(0);
+  const lastAppliedRefreshSeqRef = useRef(0);
 
-  const applySnapshot = useCallback((next: SystemSnapshot, authoritative = false) => {
-    if (!authoritative && !isNewerSnapshot(snapshotRef.current, next)) return;
+  const applySnapshot = useCallback((next: SystemSnapshot, authoritative = false): boolean => {
+    const current = snapshotRef.current;
+    if (!authoritative) {
+      if (!isNewerSnapshot(current, next)) return false;
+    } else {
+      // Authoritative GET /state: accept if seq went down (fresh backend/db reset) or is newer.
+      // But if it's within the SAME active scenario run and the sequence is strictly older, reject it.
+      if (
+        current &&
+        current.scenario_run_id !== null &&
+        current.scenario_run_id === next.scenario_run_id &&
+        next.latest_event_seq < current.latest_event_seq
+      ) {
+        return false;
+      }
+    }
     snapshotRef.current = next;
     setSnapshot(next);
+    return true;
   }, []);
 
   const applyEvents = useCallback((incoming: StoredEvent[]) => {
@@ -119,23 +143,67 @@ export function AeroGuardProvider({ children, client = defaultApi, pollMs = POLL
 
   const refresh = useCallback(async () => {
     const epochAtStart = commandEpochRef.current;
+    const reqSeq = ++refreshSeqRef.current;
     try {
       const [state, incidentList] = await Promise.all([client.state(), client.incidents()]);
-      // With no command overlapping this poll, GET /state is the backend's current
-      // truth even if its seq went DOWN (backend restarted on a fresh database).
-      const authoritative = epochAtStart === commandEpochRef.current && pendingRef.current === null;
-      if (authoritative && state.latest_event_seq < latestSeq(eventsRef.current)) {
-        eventsRef.current = []; // a different event store: drop history we can no longer match
+
+      // If a newer refresh request has already been applied, this response is superseded.
+      if (reqSeq < lastAppliedRefreshSeqRef.current) {
+        return;
+      }
+
+      // Check if any command overlapped this poll.
+      const noCommandOverlap = epochAtStart === commandEpochRef.current && pendingRef.current === null;
+
+      // Prevent a response for a previous scenario from updating the currently selected scenario
+      const currentRunId = snapshotRef.current?.scenario_run_id ?? null;
+      if (
+        currentRunId !== null &&
+        state.scenario_run_id !== null &&
+        state.scenario_run_id !== currentRunId &&
+        !noCommandOverlap
+      ) {
+        return;
+      }
+
+      const authoritative = noCommandOverlap;
+
+      // With no command overlapping, if seq went down, backend restarted on a fresh database.
+      if (authoritative && state.latest_event_seq < historyCursorRef.current) {
+        historyCursorRef.current = 0;
+        eventsRef.current = [];
         setEvents([]);
       }
-      applySnapshot(state, authoritative);
-      setIncidents(incidentList.incidents);
-      // Catch up on history page by page until we reach the backend's latest seq.
-      for (let page = 0; page < 20; page += 1) {
-        const history = await client.events(latestSeq(eventsRef.current));
-        applyEvents(history.events);
-        if (history.events.length < history.limit || latestSeq(eventsRef.current) >= history.latest_event_seq) break;
+
+      const applied = applySnapshot(state, authoritative);
+      if (!applied) {
+        // Snapshot was rejected as older/superseded; do not update dependent state (incidents).
+        return;
       }
+
+      lastAppliedRefreshSeqRef.current = reqSeq;
+      setIncidents(incidentList.incidents);
+
+      // Catch up on history page by page starting strictly from our pagination cursor.
+      // Command responses may have added isolated events to eventsRef, but historyCursorRef
+      // strictly advances only when a history page is successfully fetched and processed.
+      for (let page = 0; page < 20; page += 1) {
+        const history = await client.events(historyCursorRef.current);
+        applyEvents(history.events);
+        if (history.events.length > 0) {
+          const maxPageSeq = history.events[history.events.length - 1].seq;
+          if (maxPageSeq > historyCursorRef.current) {
+            historyCursorRef.current = maxPageSeq;
+          }
+        }
+        if (
+          history.events.length < history.limit ||
+          historyCursorRef.current >= history.latest_event_seq
+        ) {
+          break;
+        }
+      }
+
       setConnection("online");
       setSyncError(null);
       setLastSyncAt(Date.now());
@@ -181,14 +249,19 @@ export function AeroGuardProvider({ children, client = defaultApi, pollMs = POLL
   const runCommand = useCallback(
     async (label: string, send: () => Promise<CommandResponse>) => {
       if (pendingRef.current) return; // one command at a time: no accidental double submits
+      const commandGen = ++commandGenerationRef.current;
       pendingRef.current = label;
       commandEpochRef.current += 1;
       setPending(label);
       try {
         const response = await send();
+        // If superseded or timed out, do not apply late results
+        if (commandGenerationRef.current !== commandGen) return;
+
         // A duplicate replay returns the snapshot recorded the FIRST time, which may
         // be stale now — so we only trust fresh responses' snapshots, then re-sync.
         if (!response.duplicate) applySnapshot(response.snapshot);
+        // Add events from command response to display list without advancing historyCursorRef
         applyEvents(response.events);
         setOutcome({
           label,
@@ -197,21 +270,29 @@ export function AeroGuardProvider({ children, client = defaultApi, pollMs = POLL
           at: Date.now(),
         });
       } catch (error) {
+        if (commandGenerationRef.current !== commandGen) return;
+
         const apiError =
-          error instanceof ApiError ? error : new ApiError("CLIENT_ERROR", String(error), 0);
+          error instanceof ApiError
+            ? error
+            : new ApiError("UNCERTAIN_TRANSPORT_ERROR", String(error), 0);
+
+        const isUncertain = apiError.isUncertain;
         setOutcome({
           label,
-          status: apiError.isNetworkError ? "network" : "rejected",
+          status: isUncertain ? (apiError.isTimeout ? "uncertain" : "network") : "rejected",
           message: apiError.message,
           code: apiError.code,
           details: apiError.details,
           at: Date.now(),
-          retry: apiError.isNetworkError ? () => void runCommand(label, send) : undefined,
+          retry: isUncertain ? () => void runCommand(label, send) : undefined,
         });
       } finally {
-        pendingRef.current = null;
-        commandEpochRef.current += 1;
-        setPending(null);
+        if (commandGenerationRef.current === commandGen) {
+          pendingRef.current = null;
+          commandEpochRef.current += 1;
+          setPending(null);
+        }
         void refresh();
       }
     },

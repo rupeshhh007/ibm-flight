@@ -1,32 +1,52 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { OutcomeBanner } from "./components/OutcomeBanner";
-import { formatVirtualTime, humanize, shortId } from "./components/format";
-import { GUARDIAN_TONE, SENTINEL_TONE } from "./components/tones";
-import { Pill } from "./components/ui";
+import { Sidebar } from "./components/Sidebar";
+import { TopTelemetryBar } from "./components/TopTelemetryBar";
 import { useAeroGuard } from "./hooks/useAeroGuard";
 import { ATCPage } from "./pages/ATCPage";
+import { BlackBoxPage } from "./pages/BlackBoxPage";
 import { CockpitPage } from "./pages/CockpitPage";
+import { FlightDeckPage } from "./pages/FlightDeckPage";
+import { GuardianPage } from "./pages/GuardianPage";
+import { SentinelPage } from "./pages/SentinelPage";
 import { SimulationPage } from "./pages/SimulationPage";
-
-const TABS = [
-  { id: "cockpit", label: "Cockpit Monitoring", Page: CockpitPage },
-  { id: "atc", label: "Fictional ATC", Page: ATCPage },
-  { id: "simulation", label: "Emergency Simulation", Page: SimulationPage },
-] as const;
-type TabId = (typeof TABS)[number]["id"];
-
-// Hash-based tabs (#cockpit, #atc, #simulation): no router dependency, and a
-// reload or shared link keeps the same screen.
-function tabFromHash(): TabId {
-  const id = window.location.hash.replace("#", "");
-  return TABS.some((t) => t.id === id) ? (id as TabId) : "simulation";
-}
+import { SimulatorPage } from "./pages/SimulatorPage";
+import { VisionPage } from "./pages/VisionPage";
+import { soundEffects } from "./utils/soundEffects";
 
 export const SIMULATION_NOTICE = "SIMULATION ONLY — NOT FOR OPERATIONAL AVIATION USE";
+
+const TABS = [
+  { id: "deck", label: "Flight Deck", Page: FlightDeckPage },
+  { id: "guardian", label: "Guardian", Page: GuardianPage },
+  { id: "sentinel", label: "Sentinel", Page: SentinelPage },
+  { id: "vision", label: "Vision", Page: VisionPage },
+  { id: "simulator", label: "Simulator", Page: SimulatorPage },
+  { id: "blackbox", label: "Black Box", Page: BlackBoxPage },
+  { id: "scenarios", label: "Scenarios", Page: SimulationPage },
+  { id: "simulation", label: "Emergency Simulation", Page: SimulationPage },
+  { id: "cockpit", label: "Cockpit Monitoring", Page: CockpitPage },
+  { id: "atc", label: "Fictional ATC", Page: ATCPage },
+] as const;
+
+type TabId = (typeof TABS)[number]["id"];
+
+function tabFromHash(): TabId {
+  const hash = window.location.hash.replace("#", "").toLowerCase();
+  if (hash === "flight-deck" || hash === "deck") return "deck";
+  const found = TABS.find((t) => t.id === hash);
+  return found ? found.id : "simulation";
+}
 
 export function App() {
   const [tab, setTab] = useState<TabId>(tabFromHash);
   const { snapshot, connection, syncError, lastSyncAt, pending, outcome, dismissOutcome } = useAeroGuard();
+
+  const prevGuardianStateRef = useRef(snapshot?.guardian_state);
+  const prevSentinelStateRef = useRef(snapshot?.sentinel_state);
+  const prevRunIdRef = useRef(snapshot?.scenario_run_id);
+  const prevActionRef = useRef(snapshot?.last_simulator_action?.action_id);
+  const prevOutcomeRef = useRef(outcome?.at);
 
   useEffect(() => {
     const onHash = () => setTab(tabFromHash());
@@ -34,81 +54,137 @@ export function App() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
-  const active = TABS.find((t) => t.id === tab) ?? TABS[2];
-  const connectionTone = connection === "online" ? (syncError ? "warn" : "ok") : connection === "offline" ? "alert" : "muted";
+  // Unlock AudioContext on first user interaction
+  useEffect(() => {
+    const handleUserInteraction = () => {
+      soundEffects.ensureAudioContext();
+    };
+    window.addEventListener("click", handleUserInteraction, { once: true });
+    window.addEventListener("keydown", handleUserInteraction, { once: true });
+    return () => {
+      window.removeEventListener("click", handleUserInteraction);
+      window.removeEventListener("keydown", handleUserInteraction);
+    };
+  }, []);
+
+  // Scenario & Emergency avionics sound triggers
+  useEffect(() => {
+    if (!snapshot) return;
+
+    // Scenario started: play scenario-specific sound
+    if (snapshot.scenario_run_id && snapshot.scenario_run_id !== prevRunIdRef.current) {
+      prevRunIdRef.current = snapshot.scenario_run_id;
+      if (snapshot.scenario_id) {
+        soundEffects.playScenarioAlert(snapshot.scenario_id);
+      }
+    }
+
+    // Guardian emergency escalation
+    if (snapshot.guardian_state !== prevGuardianStateRef.current) {
+      if (snapshot.guardian_state === "ESCALATED") {
+        soundEffects.playMasterWarning(2400);
+      } else if (snapshot.guardian_state === "AWAITING_ACK" || snapshot.guardian_state === "SUSPECTED") {
+        soundEffects.playMasterCaution();
+      }
+      prevGuardianStateRef.current = snapshot.guardian_state;
+    }
+
+    // Sentinel state transition
+    if (snapshot.sentinel_state !== prevSentinelStateRef.current) {
+      if (snapshot.sentinel_state === "AWAITING_ATC") {
+        soundEffects.playATCRadioChime();
+      }
+      prevSentinelStateRef.current = snapshot.sentinel_state;
+    }
+
+    // Simulator action execution
+    if (snapshot.last_simulator_action && snapshot.last_simulator_action.action_id !== prevActionRef.current) {
+      prevActionRef.current = snapshot.last_simulator_action.action_id;
+      soundEffects.playActionTone();
+    }
+  }, [snapshot]);
+
+  // Audio feedback on accepted pilot acknowledgment & ATC approvals
+  useEffect(() => {
+    if (!outcome || outcome.at === prevOutcomeRef.current) return;
+    prevOutcomeRef.current = outcome.at;
+
+    if (outcome.status === "accepted") {
+      const lower = outcome.label.toLowerCase();
+      if (lower.includes("acknowledge")) {
+        soundEffects.playAckChime();
+      } else if (lower.includes("atc") || lower.includes("approve")) {
+        soundEffects.playActionTone();
+      }
+    }
+  }, [outcome]);
+
+  const active = TABS.find((t) => t.id === tab) ?? TABS[0];
 
   return (
-    <div className="app">
+    <div className="cyber-dashboard-root">
+      {/* Simulation Mandatory Notice Banner */}
       <div className="sim-banner" role="note">
         {SIMULATION_NOTICE}
       </div>
 
-      <header className="topbar">
-        <div className="brand">
-          <svg viewBox="0 0 32 32" className="brand__mark" aria-hidden="true">
-            <path d="M16 3 L27 8 V16 C27 22.5 22.4 27.4 16 29 C9.6 27.4 5 22.5 5 16 V8 Z" />
-            <path d="M16 10 L17.6 15 L23 16.5 L17.6 18 L16 23 L14.4 18 L9 16.5 L14.4 15 Z" className="brand__plane" />
-          </svg>
-          <div>
-            <h1 className="brand__name">AeroGuard</h1>
-            <p className="brand__tag">Cockpit monitoring & emergency-response simulation</p>
-          </div>
-        </div>
+      <div className="cyber-layout-wrapper">
+        {/* Left Aerospace Sidebar */}
+        <Sidebar currentTab={tab} onSelectTab={(newTab) => setTab(newTab as TabId)} />
 
-        <div className="topbar__status" aria-label="System status">
-          <Pill tone={connectionTone} pulse={connection === "connecting"}>
-            Backend {connection === "online" ? (syncError ? "degraded" : "online") : connection}
-          </Pill>
-          {snapshot && (
-            <>
-              <Pill tone={GUARDIAN_TONE[snapshot.guardian_state]}>Guardian {humanize(snapshot.guardian_state)}</Pill>
-              <Pill tone={SENTINEL_TONE[snapshot.sentinel_state]}>Sentinel {humanize(snapshot.sentinel_state)}</Pill>
-              <span className="topbar__run mono" title={snapshot.scenario_run_id ?? undefined}>
-                {snapshot.scenario_id ?? "no scenario"} · run {shortId(snapshot.scenario_run_id)} · T {formatVirtualTime(snapshot.virtual_time)}
-              </span>
-            </>
+        {/* Main Content Area */}
+        <div className="cyber-main-content">
+          {/* Top Flight Telemetry Strip */}
+          <TopTelemetryBar />
+
+          {/* Quick Nav Pill Tabs for direct accessibility */}
+          <nav className="tabs tabs--quick" role="tablist" aria-label="Screens">
+            {TABS.filter((t) => ["deck", "guardian", "sentinel", "vision", "blackbox", "simulation", "cockpit", "atc"].includes(t.id)).map((t) => (
+              <a
+                key={t.id}
+                href={`#${t.id}`}
+                role="tab"
+                aria-selected={tab === t.id}
+                className={`tabs__tab ${tab === t.id ? "is-active" : ""}`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  window.location.hash = t.id;
+                  setTab(t.id);
+                }}
+              >
+                {t.label}
+              </a>
+            ))}
+          </nav>
+
+          {/* Connection Alerts */}
+          {connection === "offline" && (
+            <div className="offline" role="alert">
+              <strong>Backend unreachable.</strong> Start it with <code>make backend</code> (127.0.0.1:8000). Showing the last
+              confirmed data{lastSyncAt ? ` from ${new Date(lastSyncAt).toLocaleTimeString()}` : ""}; retrying automatically.
+            </div>
           )}
+          {connection === "online" && syncError && (
+            <div className="offline offline--warn" role="alert">
+              Sync problem: {syncError}
+            </div>
+          )}
+
+          {/* Command Outcome Banner */}
+          <OutcomeBanner pending={pending} outcome={outcome} onDismiss={dismissOutcome} />
+
+          {/* Active Screen Tabpanel */}
+          <main className="main-viewport" role="tabpanel" aria-label={active.label}>
+            <active.Page />
+          </main>
+
+          {/* Bottom Compliance Footer */}
+          <footer className="cyber-footer">
+            <span>{SIMULATION_NOTICE}</span>
+            <span>Synthetic flight demonstration · IBM Z Datathon · Non-operational simulation</span>
+          </footer>
         </div>
-      </header>
-
-      <nav className="tabs" role="tablist" aria-label="Screens">
-        {TABS.map((t) => (
-          <a
-            key={t.id}
-            href={`#${t.id}`}
-            role="tab"
-            aria-selected={tab === t.id}
-            className={`tabs__tab ${tab === t.id ? "is-active" : ""}`}
-          >
-            {t.label}
-            {t.id === "atc" && snapshot?.sentinel_state === "AWAITING_ATC" && <span className="tabs__badge" aria-label="Decision required" />}
-            {t.id === "cockpit" && snapshot?.active_incident && <span className="tabs__badge" aria-label="Active incident" />}
-          </a>
-        ))}
-      </nav>
-
-      {connection === "offline" && (
-        <div className="offline" role="alert">
-          <strong>Backend unreachable.</strong> Start it with <code>make backend</code> (127.0.0.1:8000). Showing the last
-          confirmed data{lastSyncAt ? ` from ${new Date(lastSyncAt).toLocaleTimeString()}` : ""}; retrying automatically.
-        </div>
-      )}
-      {connection === "online" && syncError && (
-        <div className="offline offline--warn" role="alert">
-          Sync problem: {syncError}
-        </div>
-      )}
-
-      <OutcomeBanner pending={pending} outcome={outcome} onDismiss={dismissOutcome} />
-
-      <main className="main" role="tabpanel" aria-label={active.label}>
-        <active.Page />
-      </main>
-
-      <footer className="footer">
-        <span>{SIMULATION_NOTICE}</span>
-        <span>Synthetic data · deterministic mock scenarios · no real aircraft, avionics or ATC</span>
-      </footer>
+      </div>
     </div>
   );
 }

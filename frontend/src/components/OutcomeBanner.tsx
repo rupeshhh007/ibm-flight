@@ -5,6 +5,7 @@ const TITLES: Record<CommandOutcome["status"], string> = {
   duplicate: "Duplicate command — backend returned the original result, nothing re-executed",
   rejected: "Rejected by backend",
   network: "Backend unreachable — command outcome unknown",
+  uncertain: "Transport error — command outcome uncertain; backend may have executed the action",
 };
 
 /** Shows the backend's verdict on the most recent command; announced to screen readers. */
