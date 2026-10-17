@@ -18,6 +18,8 @@ class Point2D:
     y: float
 
     def in_bounds(self) -> bool:
+        if math.isnan(self.x) or math.isnan(self.y) or math.isinf(self.x) or math.isinf(self.y):
+            return False
         return 0.0 <= self.x <= 1.0 and 0.0 <= self.y <= 1.0
 
 
@@ -33,6 +35,10 @@ class NormalizedROI:
     y_max: float
 
     def __post_init__(self) -> None:
+        for val in (self.x_min, self.y_min, self.x_max, self.y_max):
+            if not isinstance(val, (int, float)) or math.isnan(val) or math.isinf(val):
+                raise ValueError(f"ROI coordinates must be finite numbers (got {val})")
+
         if not (0.0 <= self.x_min < self.x_max <= 1.0):
             raise ValueError(f"Invalid ROI horizontal bounds: x_min={self.x_min}, x_max={self.x_max}")
         if not (0.0 <= self.y_min < self.y_max <= 1.0):
@@ -51,6 +57,8 @@ class NormalizedROI:
         return self.width * self.height
 
     def contains_point(self, point: Point2D) -> bool:
+        if not point.in_bounds():
+            return False
         return self.x_min <= point.x <= self.x_max and self.y_min <= point.y <= self.y_max
 
     def overlaps(self, other: NormalizedROI) -> bool:
@@ -64,6 +72,12 @@ class NormalizedROI:
 
 
 def euclidean_distance_2d(p1: Point2D, p2: Point2D) -> float:
+    if not (p1.in_bounds() and p2.in_bounds()):
+        # Handle un-normalized or NaN/Inf points safely
+        if math.isnan(p1.x) or math.isnan(p1.y) or math.isnan(p2.x) or math.isnan(p2.y):
+            return 0.0
+        if math.isinf(p1.x) or math.isinf(p1.y) or math.isinf(p2.x) or math.isinf(p2.y):
+            return 0.0
     return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
 
@@ -80,17 +94,22 @@ def calculate_eye_aspect_ratio(
     p6: bottom lid outer
 
     EAR = (|p2 - p6| + |p3 - p5|) / (2.0 * |p1 - p4|)
-    Safely guarded against zero or near-zero denominator.
+    Safely guarded against zero, near-zero, NaN, and Inf denominators.
     """
-    p1, p2, p3, p4, p5, p6 = eye_points
-    horizontal_dist = euclidean_distance_2d(p1, p4)
-    if horizontal_dist < 1e-6:
-        return 0.0
+    try:
+        p1, p2, p3, p4, p5, p6 = eye_points
+        horizontal_dist = euclidean_distance_2d(p1, p4)
+        if horizontal_dist < 1e-6 or math.isnan(horizontal_dist) or math.isinf(horizontal_dist):
+            return 0.0
 
-    v1 = euclidean_distance_2d(p2, p6)
-    v2 = euclidean_distance_2d(p3, p5)
-    ear = (v1 + v2) / (2.0 * horizontal_dist)
-    return max(0.0, ear)
+        v1 = euclidean_distance_2d(p2, p6)
+        v2 = euclidean_distance_2d(p3, p5)
+        ear = (v1 + v2) / (2.0 * horizontal_dist)
+        if math.isnan(ear) or math.isinf(ear):
+            return 0.0
+        return max(0.0, min(1.0, ear))
+    except Exception:
+        return 0.0
 
 
 # MediaPipe FaceMesh standard landmark indices for left and right eyes
@@ -114,29 +133,36 @@ def extract_ear_from_landmarks(
         else:
             left_points = tuple(landmarks[idx] for idx in LEFT_EYE_INDICES)
             right_points = tuple(landmarks[idx] for idx in RIGHT_EYE_INDICES)
-    except (IndexError, KeyError):
+    except (IndexError, KeyError, TypeError):
         return 0.0, 0.0, 0.0
 
     left_ear = calculate_eye_aspect_ratio(left_points)
     right_ear = calculate_eye_aspect_ratio(right_points)
     avg_ear = (left_ear + right_ear) / 2.0
-    return left_ear, right_ear, avg_ear
+    if math.isnan(avg_ear) or math.isinf(avg_ear):
+        return 0.0, 0.0, 0.0
+    return left_ear, right_ear, round(avg_ear, 4)
 
 
 def compute_landmarks_bbox(landmarks: Sequence[Point2D]) -> tuple[float, float, float, float] | None:
-    """Return (x_min, y_min, x_max, y_max) of landmarks, or None if empty."""
+    """Return (x_min, y_min, x_max, y_max) of landmarks, or None if empty or invalid."""
     if not landmarks:
         return None
-    xs = [p.x for p in landmarks]
-    ys = [p.y for p in landmarks]
+    xs = [p.x for p in landmarks if not (math.isnan(p.x) or math.isinf(p.x))]
+    ys = [p.y for p in landmarks if not (math.isnan(p.y) or math.isinf(p.y))]
+    if not xs or not ys:
+        return None
     return min(xs), min(ys), max(xs), max(ys)
 
 
 def compute_landmarks_center(landmarks: Sequence[Point2D]) -> Point2D | None:
     if not landmarks:
         return None
-    avg_x = sum(p.x for p in landmarks) / len(landmarks)
-    avg_y = sum(p.y for p in landmarks) / len(landmarks)
+    valid_points = [p for p in landmarks if not (math.isnan(p.x) or math.isnan(p.y) or math.isinf(p.x) or math.isinf(p.y))]
+    if not valid_points:
+        return None
+    avg_x = sum(p.x for p in valid_points) / len(valid_points)
+    avg_y = sum(p.y for p in valid_points) / len(valid_points)
     return Point2D(avg_x, avg_y)
 
 
@@ -147,6 +173,11 @@ def evaluate_landmark_quality(landmarks: Sequence[Point2D]) -> tuple[bool, float
     """
     if not landmarks or len(landmarks) < 6:
         return False, 0.0
+
+    # NaN / Inf guard
+    for p in landmarks:
+        if math.isnan(p.x) or math.isnan(p.y) or math.isinf(p.x) or math.isinf(p.y):
+            return False, 0.0
 
     in_bounds_count = sum(1 for p in landmarks if p.in_bounds())
     ratio = in_bounds_count / len(landmarks)
@@ -169,4 +200,6 @@ def evaluate_landmark_quality(landmarks: Sequence[Point2D]) -> tuple[bool, float
 
     # Higher score for centered, well-sized faces with 100% in-bounds landmarks
     quality = min(1.0, 0.5 + 0.5 * ratio)
-    return True, round(quality, 3)
+    if math.isnan(quality) or math.isinf(quality):
+        return False, 0.0
+    return True, round(max(0.0, min(1.0, quality)), 3)

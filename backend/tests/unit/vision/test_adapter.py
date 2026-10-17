@@ -163,3 +163,46 @@ def test_close_is_idempotent() -> None:
     adapter = RealVisionAdapter(source=source)
     adapter.close()
     adapter.close()  # No error on repeated close
+
+
+def test_observe_handles_source_exception_safely(base_time: datetime) -> None:
+    """
+    Regression test for Review Item 4:
+    Source failures must not crash observe(); must fail-closed as UNKNOWN.
+    """
+    failing_source = ReplayLandmarkSource()
+
+    def raise_error(pilot_id, t, cfg):
+        raise RuntimeError("Camera hardware failure")
+
+    failing_source.set_pilot_generator(PilotId.PILOT_1, raise_error)
+    adapter = RealVisionAdapter(source=failing_source)
+
+    obs = adapter.observe(PilotId.PILOT_1, base_time)
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs.camera_available is False
+    assert obs.face_visible is False
+    assert obs.observation_quality == 0.0
+
+
+def test_config_safeguards_reject_zero_and_invalid_durations() -> None:
+    """
+    Regression test for Review Item 5:
+    Zero-duration settings must be rejected by configuration validation.
+    """
+    # min_observation_duration_ms < 500
+    with pytest.raises(ValueError, match="min_observation_duration_ms must be >= 500"):
+        VisionConfig(min_observation_duration_ms=0)
+
+    # min_closed_window_ms < 1000
+    with pytest.raises(ValueError, match="min_closed_window_ms must be >= 1000"):
+        VisionConfig(min_closed_window_ms=200)
+
+    # min_closed_window_ms < min_observation_duration_ms
+    with pytest.raises(ValueError, match="min_closed_window_ms must be >= min_observation_duration_ms"):
+        VisionConfig(min_observation_duration_ms=2000, min_closed_window_ms=1500)
+
+    # NaN / Inf in thresholds
+    with pytest.raises(ValueError, match="finite number"):
+        VisionConfig(min_usable_quality=float("nan"))
+

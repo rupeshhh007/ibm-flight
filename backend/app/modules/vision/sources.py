@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 from app.contracts.enums import PilotId
 from .config import VisionConfig
@@ -89,6 +89,12 @@ def create_synthetic_landmarks(
     landmarks[380] = Point2D(rx - h_dist / 4, ry + v_dist / 2)
     landmarks[373] = Point2D(rx + h_dist / 4, ry + v_dist / 2)
 
+    # Place face boundary points (forehead, chin, cheeks) for realistic bbox
+    landmarks[10] = Point2D(center_x, max(0.01, center_y - scale * 0.6))
+    landmarks[152] = Point2D(center_x, min(0.99, center_y + scale * 0.6))
+    landmarks[234] = Point2D(max(0.01, center_x - scale * 0.6), center_y)
+    landmarks[454] = Point2D(min(0.99, center_x + scale * 0.6), center_y)
+
     return landmarks
 
 
@@ -136,10 +142,18 @@ class ReplayLandmarkSource:
         virtual_time: datetime,
         config: VisionConfig,
     ) -> PilotFrameEvidence:
+        # Normalize virtual_time to UTC
+        if virtual_time.tzinfo is None:
+            virtual_time = virtual_time.replace(tzinfo=timezone.utc)
+        else:
+            virtual_time = virtual_time.astimezone(timezone.utc)
+
+        now_mono = time.monotonic()
+
         if self._closed:
             return PilotFrameEvidence(
                 virtual_time=virtual_time,
-                monotonic_capture_time=time.monotonic(),
+                monotonic_capture_time=now_mono,
                 camera_available=False,
                 face_visible=False,
                 eyes_closed=False,
@@ -147,6 +161,21 @@ class ReplayLandmarkSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="source_closed",
+            )
+
+        # Invariant: Channel must be explicitly configured and enabled
+        channel = config.pilot_channels.get(pilot_id)
+        if channel is None or not channel.enabled:
+            return PilotFrameEvidence(
+                virtual_time=virtual_time,
+                monotonic_capture_time=now_mono,
+                camera_available=False,
+                face_visible=False,
+                eyes_closed=False,
+                ear=None,
+                quality=0.0,
+                is_usable=False,
+                error_reason="channel_disabled_or_unassigned",
             )
 
         # Check for injected custom generator
@@ -162,7 +191,6 @@ class ReplayLandmarkSource:
             return sample
 
         # Default replay track matching stable scenarios
-        now_mono = time.monotonic()
         if self._scenario_id == "camera_obstructed":
             return PilotFrameEvidence(
                 virtual_time=virtual_time,
@@ -240,23 +268,26 @@ class OpenCVCaptureSource:
     """
     Optional live webcam or local video file capture source using OpenCV.
     Lazily imports cv2. If OpenCV is not installed, raises an informative error at construction time.
+    Enforces per-pilot ROI cropping and requires verified face detection.
     """
 
     def __init__(
         self,
         camera_index_or_path: int | str | Path = 0,
         target_fps: int = 15,
+        face_detector: Callable[[Any], tuple[bool, list[Point2D], str | None]] | None = None,
     ) -> None:
         if not is_opencv_available():
             raise RuntimeError(
                 "OpenCV (cv2) is not installed. To use real camera/video input, install optional "
-                "packages (e.g. pip install opencv-python mediapipe). Deterministic replay mode "
+                "packages (e.g. pip install opencv-contrib-python mediapipe). Deterministic replay mode "
                 "is available without any extra packages."
             )
         import cv2  # type: ignore
 
         self._cv2 = cv2
         self._target = camera_index_or_path
+        self._face_detector = face_detector
         self._cap = cv2.VideoCapture(camera_index_or_path)
         if not self._cap.isOpened():
             logger.warning("Failed to open OpenCV capture source: %s", camera_index_or_path)
@@ -269,15 +300,27 @@ class OpenCVCaptureSource:
         self._thread = threading.Thread(target=self._capture_worker, daemon=True)
         self._thread.start()
 
+    def set_face_detector(
+        self,
+        detector: Callable[[Any], tuple[bool, list[Point2D], str | None]] | None,
+    ) -> None:
+        self._face_detector = detector
+
     def _capture_worker(self) -> None:
         delay = 1.0 / max(1, self._target_fps)
         while self._running:
-            if self._cap is not None and self._cap.isOpened():
-                ret, frame = self._cap.read()
-                if ret and frame is not None:
-                    with self._lock:
-                        self._latest_frame = frame
-                        self._latest_mono = time.monotonic()
+            if self._cap is not None:
+                try:
+                    if self._cap.isOpened():
+                        res = self._cap.read()
+                        if isinstance(res, tuple) and len(res) == 2:
+                            ret, frame = res
+                            if ret and frame is not None:
+                                with self._lock:
+                                    self._latest_frame = frame
+                                    self._latest_mono = time.monotonic()
+                except Exception:
+                    pass
             time.sleep(delay)
 
     def configure_scenario(self, scenario_id: str) -> None:
@@ -291,6 +334,36 @@ class OpenCVCaptureSource:
         config: VisionConfig,
     ) -> PilotFrameEvidence:
         now_mono = time.monotonic()
+
+        # Invariant: Channel must be explicitly configured and enabled
+        channel = config.pilot_channels.get(pilot_id)
+        if channel is None or not channel.enabled:
+            return PilotFrameEvidence(
+                virtual_time=virtual_time,
+                monotonic_capture_time=now_mono,
+                camera_available=False,
+                face_visible=False,
+                eyes_closed=False,
+                ear=None,
+                quality=0.0,
+                is_usable=False,
+                error_reason="channel_disabled_or_unassigned",
+            )
+
+        # Verify camera index mapping matches this source instance
+        if isinstance(self._target, int) and channel.camera_index is not None and channel.camera_index != self._target:
+            return PilotFrameEvidence(
+                virtual_time=virtual_time,
+                monotonic_capture_time=now_mono,
+                camera_available=False,
+                face_visible=False,
+                eyes_closed=False,
+                ear=None,
+                quality=0.0,
+                is_usable=False,
+                error_reason="channel_camera_mismatch",
+            )
+
         if not self._cap or not self._cap.isOpened():
             return PilotFrameEvidence(
                 virtual_time=virtual_time,
@@ -328,20 +401,43 @@ class OpenCVCaptureSource:
                 virtual_time=virtual_time,
                 monotonic_capture_time=frame_mono,
                 camera_available=True,
-                face_visible=True,
+                face_visible=False,
                 eyes_closed=False,
                 ear=None,
-                quality=0.1,
+                quality=0.0,
                 is_usable=False,
                 error_reason="stale_frame",
             )
 
+        # Isolate pilot ROI: crop frame to the assigned sub-region
+        if channel.roi is not None:
+            h, w = frame.shape[:2]
+            x1 = max(0, int(channel.roi.x_min * w))
+            y1 = max(0, int(channel.roi.y_min * h))
+            x2 = min(w, int(channel.roi.x_max * w))
+            y2 = min(h, int(channel.roi.y_max * h))
+            if x2 <= x1 or y2 <= y1:
+                return PilotFrameEvidence(
+                    virtual_time=virtual_time,
+                    monotonic_capture_time=frame_mono,
+                    camera_available=True,
+                    face_visible=False,
+                    eyes_closed=False,
+                    ear=None,
+                    quality=0.0,
+                    is_usable=False,
+                    error_reason="invalid_or_empty_roi",
+                )
+            pilot_frame = frame[y1:y2, x1:x2]
+        else:
+            pilot_frame = frame
+
         # Basic image quality: blur (Laplacian variance) and illumination (mean brightness)
-        gray = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2GRAY)
+        gray = self._cv2.cvtColor(pilot_frame, self._cv2.COLOR_BGR2GRAY)
         mean_brightness = float(self._cv2.mean(gray)[0])
         laplacian_var = float(self._cv2.Laplacian(gray, self._cv2.CV_64F).var())
 
-        # Check illumination bounds (0 to 255)
+        # Check illumination bounds
         if mean_brightness < 20.0 or mean_brightness > 240.0:
             return PilotFrameEvidence(
                 virtual_time=virtual_time,
@@ -350,7 +446,7 @@ class OpenCVCaptureSource:
                 face_visible=False,
                 eyes_closed=False,
                 ear=None,
-                quality=0.1,
+                quality=0.0,
                 is_usable=False,
                 error_reason="poor_illumination",
             )
@@ -364,27 +460,70 @@ class OpenCVCaptureSource:
                 face_visible=False,
                 eyes_closed=False,
                 ear=None,
-                quality=0.2,
+                quality=0.0,
                 is_usable=False,
                 error_reason="severe_blur",
             )
 
-        # Quality estimation based on frame attributes
-        illum_score = min(1.0, mean_brightness / 128.0) if mean_brightness <= 128 else min(1.0, (255 - mean_brightness) / 127.0 + 0.5)
-        blur_score = min(1.0, laplacian_var / 200.0)
-        quality = round(max(0.3, min(0.95, (illum_score + blur_score) / 2.0)), 2)
+        # Invariant 1: Verified face detection is mandatory.
+        # Clear frames with no face must NEVER produce face_visible=True or RESPONSIVE observations.
+        if self._face_detector is not None:
+            detected, landmarks, err = self._face_detector(pilot_frame)
+            if not detected or not landmarks:
+                return PilotFrameEvidence(
+                    virtual_time=virtual_time,
+                    monotonic_capture_time=frame_mono,
+                    camera_available=True,
+                    face_visible=False,
+                    eyes_closed=False,
+                    ear=None,
+                    quality=0.0,
+                    is_usable=False,
+                    error_reason=err or "no_face_detected_in_roi",
+                )
 
-        return PilotFrameEvidence(
-            virtual_time=virtual_time,
-            monotonic_capture_time=frame_mono,
-            camera_available=True,
-            face_visible=True,
-            eyes_closed=False,
-            ear=0.30,
-            quality=quality,
-            is_usable=quality >= config.min_usable_quality,
-            error_reason=None,
-        )
+            # Evaluate landmark quality
+            usable, lmk_quality = evaluate_landmark_quality(landmarks)
+            if not usable or lmk_quality < config.min_usable_quality:
+                return PilotFrameEvidence(
+                    virtual_time=virtual_time,
+                    monotonic_capture_time=frame_mono,
+                    camera_available=True,
+                    face_visible=True,
+                    eyes_closed=False,
+                    ear=None,
+                    quality=lmk_quality,
+                    is_usable=False,
+                    error_reason="sub_threshold_landmark_quality",
+                )
+
+            left_ear, right_ear, avg_ear = extract_ear_from_landmarks(landmarks)
+            eyes_closed = avg_ear < config.eye_closed_ear_threshold
+
+            return PilotFrameEvidence(
+                virtual_time=virtual_time,
+                monotonic_capture_time=frame_mono,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=eyes_closed,
+                ear=avg_ear,
+                quality=lmk_quality,
+                is_usable=True,
+                error_reason=None,
+            )
+        else:
+            # Without verified face detection running on the frame, fail-closed as UNKNOWN
+            return PilotFrameEvidence(
+                virtual_time=virtual_time,
+                monotonic_capture_time=frame_mono,
+                camera_available=True,
+                face_visible=False,
+                eyes_closed=False,
+                ear=None,
+                quality=0.0,
+                is_usable=False,
+                error_reason="no_verified_face_detection_available",
+            )
 
     def close(self) -> None:
         self._running = False

@@ -376,3 +376,161 @@ def test_reset_clears_window(base_time: datetime, config: VisionConfig) -> None:
     assert window.latest_sample is not None
     window.reset()
     assert window.latest_sample is None
+
+
+def test_out_of_order_samples_are_rejected(base_time: datetime, config: VisionConfig) -> None:
+    """Regression test for Review Item 3: Out-of-order samples must not corrupt timeline."""
+    window = PilotEvidenceWindow()
+    t1 = base_time
+    t2 = base_time + timedelta(milliseconds=500)
+    t_stale = base_time - timedelta(milliseconds=500)  # Earlier than t1
+
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t1,
+            monotonic_capture_time=100.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.32,
+            quality=0.95,
+            is_usable=True,
+        )
+    )
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t2,
+            monotonic_capture_time=100.5,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.32,
+            quality=0.95,
+            is_usable=True,
+        )
+    )
+
+    # Attempt to add an out-of-order sample
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t_stale,
+            monotonic_capture_time=99.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.10,
+            quality=0.90,
+            is_usable=True,
+        )
+    )
+
+    # Out of order sample must not become latest
+    assert window.latest_sample.virtual_time == t2
+
+
+def test_repeated_duplicate_samples_do_not_inflate_duration(
+    base_time: datetime, config: VisionConfig
+) -> None:
+    """
+    Regression test for Review Item 3:
+    Repeated observations at the exact same timestamp must not inflate sample count or duration.
+    """
+    window = PilotEvidenceWindow()
+    # Add 10 duplicate samples at the exact same timestamp
+    for _ in range(10):
+        window.add_sample(
+            PilotFrameEvidence(
+                virtual_time=base_time,
+                monotonic_capture_time=100.0,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=True,
+                ear=0.10,
+                quality=0.95,
+                is_usable=True,
+            )
+        )
+
+    # Window should deduplicate in place; sample count in deque should be 1
+    assert len(window._samples) == 1
+    obs = window.evaluate(PilotId.PILOT_1, base_time, config)
+    # Single timestamp cannot produce duration or POSSIBLY_UNRESPONSIVE
+    assert obs.observation_duration_ms == 0
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+
+
+def test_future_samples_relative_to_observed_at_are_excluded(
+    base_time: datetime, config: VisionConfig
+) -> None:
+    """Regression test for Review Item 3: Future samples relative to observed_at are excluded."""
+    window = PilotEvidenceWindow()
+    t_past = base_time
+    t_future = base_time + timedelta(milliseconds=5000)
+
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t_past,
+            monotonic_capture_time=100.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.30,
+            quality=0.90,
+            is_usable=True,
+        )
+    )
+    window.add_sample(
+        PilotFrameEvidence(
+            virtual_time=t_future,
+            monotonic_capture_time=105.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.10,
+            quality=0.90,
+            is_usable=True,
+        )
+    )
+
+    # Evaluating at base_time should NOT see the future sample
+    obs = window.evaluate(PilotId.PILOT_1, base_time, config)
+    assert obs.eyes_closed is False
+
+
+def test_nan_and_inf_quality_handled_safely(base_time: datetime, config: VisionConfig) -> None:
+    """Regression test for Review Item 4: NaN and Inf quality values must yield UNKNOWN."""
+    # NaN quality
+    sample_nan = PilotFrameEvidence(
+        virtual_time=base_time,
+        monotonic_capture_time=100.0,
+        camera_available=True,
+        face_visible=True,
+        eyes_closed=False,
+        ear=0.30,
+        quality=float("nan"),
+        is_usable=True,
+    )
+    assert sample_nan.quality == 0.0
+    assert sample_nan.is_usable is False
+
+    window = PilotEvidenceWindow()
+    window.add_sample(sample_nan)
+    obs = window.evaluate(PilotId.PILOT_1, base_time, config)
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs.observation_quality == 0.0
+
+
+def test_naive_virtual_time_rejected_by_pilot_frame_evidence() -> None:
+    """Regression test: Naive virtual_time raises ValueError."""
+    naive_dt = datetime(2026, 1, 1, 12, 0, 0)
+    with pytest.raises(ValueError, match="timezone-aware UTC"):
+        PilotFrameEvidence(
+            virtual_time=naive_dt,
+            monotonic_capture_time=100.0,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=False,
+            ear=0.30,
+            quality=0.90,
+            is_usable=True,
+        )

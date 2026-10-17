@@ -1,6 +1,6 @@
 # AeroGuard Vision Subsystem
 
-> **SIMULATION ONLY — NOT FOR OPERATIONAL AVIATION USE**  
+> **SIMULATION ONLY — NOT FOR OPERATIONAL AVIATION USE**
 > This software is a simulation demonstration developed for the IBM Z Datathon 2026. It is not designed, certified, or intended for operational flight monitoring, avionics integration, medical diagnosis, or pilot alertness assessment.
 
 ## Overview
@@ -26,7 +26,7 @@ class VisionAdapter(Protocol):
    - Single-frame blinks or closed-eye readings do not trigger `POSSIBLY_UNRESPONSIVE`.
    - Concerning visual cues must persist across a configured window (`min_closed_window_ms`, default 3,000 ms) with high-quality continuous evidence.
    - Positive responsiveness requires sustained clear cues (`min_open_window_ms`, default 1,000 ms).
-   - Any gap or invalid frame resets the accumulated duration.
+   - Any gap, timestamp jump, or invalid frame resets the accumulated duration.
 4. **Single-Webcam Limitation**:
    - A single laptop camera monitors a single pilot. Dual-pilot demonstration with a single camera requires explicit disjoint non-overlapping ROIs (`VisionConfig.split_frame()`), or synthetic scenario replay.
 
@@ -35,16 +35,17 @@ class VisionAdapter(Protocol):
 - **`MockVisionAdapter`**: P0 default mock returning deterministic scenario outcomes for the 5 benchmark scenarios.
 - **`RealVisionAdapter`**: Uncertainty-aware real adapter using pure-Python geometry, bounded evidence windows, and configurable frame sources.
 - **`ReplayLandmarkSource`**: Deterministic replay provider with zero external dependencies.
-- **`OpenCVCaptureSource`**: Optional hardware camera / video file capture provider (requires optional `opencv-python` and `mediapipe`).
+- **`OpenCVCaptureSource`**: Optional hardware camera / video file capture provider (requires optional `opencv-contrib-python` and `mediapipe`).
 
 ## Dependencies
 
 - **Offline/Replay Mode**: No external CV packages required (uses pure-Python geometry and synthetic landmarks).
-- **Optional Camera/MediaPipe Mode**: Pinned in `backend/app/modules/vision/requirements.txt` and root `requirements.txt`:
+- **Optional Camera/MediaPipe Mode**: Pinned in `backend/app/modules/vision/requirements.txt`:
   ```bash
   pip install -r backend/app/modules/vision/requirements.txt
   ```
-  Verified versions: `opencv-python==5.0.0.93`, `mediapipe==1.1.1`, `numpy==2.4.6`.
+  Verified versions: `mediapipe==1.1.1`, `opencv-contrib-python==5.0.0.93`, `numpy==2.4.6`.
+  Note: Keep optional; do NOT require on LinuxONE s390x.
 
 ## Composition Root Integration (for Abhinav)
 
@@ -52,6 +53,7 @@ To wire `RealVisionAdapter` into `backend/app/main.py`:
 
 ```python
 from app.modules.vision import RealVisionAdapter, VisionConfig
+from app.contracts.enums import PilotId
 
 # Standard dual-pilot split frame replay:
 vision_adapter = RealVisionAdapter(config=VisionConfig.split_frame())

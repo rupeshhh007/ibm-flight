@@ -139,3 +139,26 @@ def test_evaluate_landmark_quality() -> None:
     tiny = [Point2D(0.5001, 0.5001) for _ in range(20)]
     usable, score = evaluate_landmark_quality(tiny)
     assert usable is False
+
+    # NaN / Inf in landmarks
+    nan_landmarks = [Point2D(float("nan"), 0.5) for _ in range(20)]
+    usable, score = evaluate_landmark_quality(nan_landmarks)
+    assert usable is False
+    assert score == 0.0
+
+
+def test_geometry_nan_inf_safeguards() -> None:
+    """Regression test for Review Item 4: NaN and Inf points handled safely."""
+    p_nan = Point2D(float("nan"), 0.5)
+    p_inf = Point2D(float("inf"), 0.5)
+    assert p_nan.in_bounds() is False
+    assert p_inf.in_bounds() is False
+
+    # NormalizedROI rejects NaN
+    with pytest.raises(ValueError, match="finite numbers"):
+        NormalizedROI(float("nan"), 0.0, 0.5, 1.0)
+
+    # calculate_eye_aspect_ratio returns 0.0 with NaN points
+    p_valid = Point2D(0.5, 0.5)
+    ear = calculate_eye_aspect_ratio((p_nan, p_valid, p_valid, p_valid, p_valid, p_valid))
+    assert ear == 0.0

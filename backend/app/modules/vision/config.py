@@ -73,16 +73,46 @@ class VisionConfig:
         self.validate()
 
     def validate(self) -> None:
-        if not (0.0 <= self.min_usable_quality <= 1.0):
-            raise ValueError("min_usable_quality must be in [0.0, 1.0]")
-        if not (0.0 <= self.min_face_confidence <= 1.0):
-            raise ValueError("min_face_confidence must be in [0.0, 1.0]")
-        if not (0.0 < self.min_valid_frame_ratio <= 1.0):
-            raise ValueError("min_valid_frame_ratio must be in (0.0, 1.0]")
-        if self.eye_closed_ear_threshold >= self.eye_open_ear_threshold:
-            raise ValueError("eye_closed_ear_threshold must be strictly less than eye_open_ear_threshold")
-        if self.min_closed_window_ms < 0 or self.min_open_window_ms < 0:
-            raise ValueError("Temporal window durations cannot be negative")
+        import math
+
+        for name, val in [
+            ("min_usable_quality", self.min_usable_quality),
+            ("min_face_confidence", self.min_face_confidence),
+            ("min_valid_frame_ratio", self.min_valid_frame_ratio),
+            ("eye_closed_ear_threshold", self.eye_closed_ear_threshold),
+            ("eye_open_ear_threshold", self.eye_open_ear_threshold),
+        ]:
+            if not isinstance(val, (int, float)) or math.isnan(val) or math.isinf(val):
+                raise ValueError(f"{name} must be a finite number")
+
+        if not (0.0 < self.min_usable_quality <= 1.0):
+            raise ValueError("min_usable_quality must be strictly positive in (0.0, 1.0]")
+        if not (0.0 < self.min_face_confidence <= 1.0):
+            raise ValueError("min_face_confidence must be strictly positive in (0.0, 1.0]")
+        if not (0.5 <= self.min_valid_frame_ratio <= 1.0):
+            raise ValueError("min_valid_frame_ratio must be in [0.5, 1.0]")
+        if not (0.0 <= self.eye_closed_ear_threshold < self.eye_open_ear_threshold <= 1.0):
+            raise ValueError(
+                "eye_closed_ear_threshold must be strictly less than eye_open_ear_threshold and both in [0.0, 1.0]"
+            )
+
+        # Minimum evidence duration safeguards: prevent 0-duration single-sample triggers
+        if self.min_observation_duration_ms < 500:
+            raise ValueError(
+                f"min_observation_duration_ms must be >= 500 ms to prevent single-sample triggers (got {self.min_observation_duration_ms})"
+            )
+        if self.min_closed_window_ms < 1_000:
+            raise ValueError(
+                f"min_closed_window_ms must be >= 1000 ms to enforce sustained closure evidence (got {self.min_closed_window_ms})"
+            )
+        if self.min_closed_window_ms < self.min_observation_duration_ms:
+            raise ValueError("min_closed_window_ms must be >= min_observation_duration_ms")
+        if self.min_open_window_ms < 500:
+            raise ValueError("min_open_window_ms must be >= 500 ms")
+        if self.max_gap_ms < 100:
+            raise ValueError("max_gap_ms must be >= 100 ms")
+        if self.max_frame_age_ms < 100:
+            raise ValueError("max_frame_age_ms must be >= 100 ms")
 
         # Non-overlap validation if both pilots share the same source and have ROIs
         ch1 = self.pilot_channels.get(PilotId.PILOT_1)

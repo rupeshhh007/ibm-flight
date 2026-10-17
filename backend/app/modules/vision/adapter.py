@@ -74,15 +74,28 @@ class RealVisionAdapter:
                 observation_quality=0.0,
             )
 
-        # Acquire frame evidence for this specific pilot
-        sample = self._source.get_sample(pilot_id, observed_at, self._config)
+        try:
+            # Acquire frame evidence for this specific pilot
+            sample = self._source.get_sample(pilot_id, observed_at, self._config)
 
-        # Record in the isolated per-pilot evidence window
-        window = self._windows[pilot_id]
-        window.add_sample(sample)
+            # Record in the isolated per-pilot evidence window
+            window = self._windows[pilot_id]
+            window.add_sample(sample)
 
-        # Evaluate window and apply conservative uncertainty rules
-        return window.evaluate(pilot_id, observed_at, self._config)
+            # Evaluate window and apply conservative uncertainty rules
+            return window.evaluate(pilot_id, observed_at, self._config)
+        except Exception as exc:
+            logger.warning("Error evaluating vision observation for %s: %s", pilot_id, exc)
+            return PilotObservation(
+                pilot_id=pilot_id,
+                observed_at=observed_at,
+                observation_status=PilotObservationStatus.UNKNOWN,
+                camera_available=False,
+                face_visible=False,
+                eyes_closed=False,
+                observation_duration_ms=0,
+                observation_quality=0.0,
+            )
 
     def close(self) -> None:
         """Idempotently close underlying sources and release resources."""

@@ -6,14 +6,18 @@ SIMULATION ONLY — NOT FOR OPERATIONAL AVIATION USE.
 
 from __future__ import annotations
 
+import logging
+import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
 from app.contracts.enums import PilotId, PilotObservationStatus
 from app.contracts.models import PilotObservation
 from .config import VisionConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +35,23 @@ class PilotFrameEvidence:
     is_usable: bool
     error_reason: str | None = None
 
+    def __post_init__(self) -> None:
+        # Guarantee timezone-aware UTC datetime
+        if self.virtual_time.tzinfo is None or self.virtual_time.utcoffset() is None:
+            raise ValueError("PilotFrameEvidence virtual_time must be timezone-aware UTC")
+
+        # Numeric validation on quality and ear
+        if not isinstance(self.quality, (int, float)) or math.isnan(self.quality) or math.isinf(self.quality):
+            object.__setattr__(self, "quality", 0.0)
+            object.__setattr__(self, "is_usable", False)
+            object.__setattr__(self, "error_reason", "invalid_numeric_quality")
+
+        if self.ear is not None:
+            if not isinstance(self.ear, (int, float)) or math.isnan(self.ear) or math.isinf(self.ear):
+                object.__setattr__(self, "ear", None)
+                object.__setattr__(self, "is_usable", False)
+                object.__setattr__(self, "error_reason", "invalid_numeric_ear")
+
 
 class PilotEvidenceWindow:
     """
@@ -43,6 +64,26 @@ class PilotEvidenceWindow:
         self._samples: deque[PilotFrameEvidence] = deque(maxlen=max_samples)
 
     def add_sample(self, sample: PilotFrameEvidence) -> None:
+        # Normalize sample virtual_time to UTC
+        if sample.virtual_time.tzinfo != timezone.utc:
+            sample = replace(sample, virtual_time=sample.virtual_time.astimezone(timezone.utc))
+
+        if self._samples:
+            last = self._samples[-1]
+            # Check for out-of-order timestamp: reject to prevent corrupting monotonic timeline
+            if sample.virtual_time < last.virtual_time:
+                logger.warning(
+                    "Rejecting out-of-order sample: %s is earlier than last %s",
+                    sample.virtual_time,
+                    last.virtual_time,
+                )
+                return
+
+            # Check for repeated / duplicate timestamp: update in place without inflating sample count
+            if sample.virtual_time == last.virtual_time:
+                self._samples[-1] = sample
+                return
+
         self._samples.append(sample)
 
     def reset(self) -> None:
@@ -64,10 +105,10 @@ class PilotEvidenceWindow:
         else:
             observed_at = observed_at.astimezone(timezone.utc)
 
-        latest = self.latest_sample
+        # 1. Filter samples: reject future samples relative to requested observed_at
+        eligible = [s for s in self._samples if s.virtual_time <= observed_at]
 
-        # 1. No evidence received at all
-        if latest is None:
+        if not eligible:
             return PilotObservation(
                 pilot_id=pilot_id,
                 observed_at=observed_at,
@@ -79,7 +120,24 @@ class PilotEvidenceWindow:
                 observation_quality=0.0,
             )
 
-        # 2. Camera unavailable
+        latest = eligible[-1]
+
+        # 2. Check evidence staleness against requested virtual timestamp
+        staleness_ms = (observed_at - latest.virtual_time).total_seconds() * 1000.0
+        if staleness_ms > config.max_gap_ms:
+            # Stale evidence: gap exceeded between latest frame and requested evaluation time
+            return PilotObservation(
+                pilot_id=pilot_id,
+                observed_at=observed_at,
+                observation_status=PilotObservationStatus.UNKNOWN,
+                camera_available=latest.camera_available,
+                face_visible=latest.face_visible,
+                eyes_closed=False,
+                observation_duration_ms=0,
+                observation_quality=0.0,
+            )
+
+        # 3. Camera unavailable
         if not latest.camera_available:
             return PilotObservation(
                 pilot_id=pilot_id,
@@ -92,7 +150,7 @@ class PilotEvidenceWindow:
                 observation_quality=0.0,
             )
 
-        # 3. Face not visible / camera obstructed
+        # 4. Face not visible / camera obstructed
         if not latest.face_visible:
             return PilotObservation(
                 pilot_id=pilot_id,
@@ -105,8 +163,9 @@ class PilotEvidenceWindow:
                 observation_quality=0.0,
             )
 
-        # 4. Error reason or sub-threshold usable quality
+        # 5. Error reason or sub-threshold usable quality
         if not latest.is_usable or latest.quality < config.min_usable_quality:
+            q = latest.quality if not (math.isnan(latest.quality) or math.isinf(latest.quality)) else 0.0
             return PilotObservation(
                 pilot_id=pilot_id,
                 observed_at=observed_at,
@@ -115,25 +174,26 @@ class PilotEvidenceWindow:
                 face_visible=True,
                 eyes_closed=False,
                 observation_duration_ms=0,
-                observation_quality=max(0.0, min(1.0, round(latest.quality, 2))),
+                observation_quality=max(0.0, min(1.0, round(q, 2))),
             )
 
-        # 5. Compute contiguous usable duration by scanning backwards
+        # 6. Compute contiguous usable duration by scanning backwards
         contiguous_samples: list[PilotFrameEvidence] = []
-        reversed_samples = list(reversed(self._samples))
         current_time = latest.virtual_time
 
-        for s in reversed_samples:
+        for s in reversed(eligible):
             if not s.is_usable or s.quality < config.min_usable_quality:
                 break
             gap_ms = (current_time - s.virtual_time).total_seconds() * 1000.0
-            if gap_ms > config.max_gap_ms:
-                break
+            if s is not latest:
+                # Monotonicity check: gap must be strictly positive and bounded
+                if gap_ms <= 0.0 or gap_ms > config.max_gap_ms:
+                    break
             contiguous_samples.append(s)
             current_time = s.virtual_time
 
-        # Calculate contiguous duration in milliseconds
-        if len(contiguous_samples) <= 1:
+        # Calculate contiguous duration in milliseconds across distinct timestamps
+        if len(contiguous_samples) < 2:
             duration_ms = 0
         else:
             earliest_time = contiguous_samples[-1].virtual_time
@@ -141,10 +201,13 @@ class PilotEvidenceWindow:
             duration_ms = max(0, min(600_000, duration_ms))
 
         # Overall quality is the mean of contiguous usable samples
-        mean_quality = sum(s.quality for s in contiguous_samples) / len(contiguous_samples)
-        bounded_quality = max(0.0, min(1.0, round(mean_quality, 2)))
+        mean_quality = sum(s.quality for s in contiguous_samples) / max(1, len(contiguous_samples))
+        if math.isnan(mean_quality) or math.isinf(mean_quality):
+            bounded_quality = 0.0
+        else:
+            bounded_quality = max(0.0, min(1.0, round(mean_quality, 2)))
 
-        # 6. Apply conservative classification rules
+        # 7. Apply conservative classification rules
         # If duration is insufficient, abstain as UNKNOWN
         if duration_ms < config.min_observation_duration_ms:
             return PilotObservation(
@@ -159,10 +222,11 @@ class PilotEvidenceWindow:
             )
 
         # Evaluate window for sustained concerning closure
-        if duration_ms >= config.min_closed_window_ms:
+        # Requires at least 2 distinct temporal samples and duration >= min_closed_window_ms
+        if duration_ms >= config.min_closed_window_ms and len(contiguous_samples) >= 2:
             cutoff = latest.virtual_time - timedelta(milliseconds=config.min_closed_window_ms)
             closed_window_samples = [s for s in contiguous_samples if s.virtual_time >= cutoff]
-            if closed_window_samples:
+            if len(closed_window_samples) >= 2:
                 closed_count = sum(1 for s in closed_window_samples if s.eyes_closed)
                 closed_ratio = closed_count / len(closed_window_samples)
                 if closed_ratio >= config.min_valid_frame_ratio:
@@ -178,10 +242,10 @@ class PilotEvidenceWindow:
                     )
 
         # Evaluate window for positive responsiveness cues (sustained open eyes)
-        if duration_ms >= config.min_open_window_ms:
+        if duration_ms >= config.min_open_window_ms and len(contiguous_samples) >= 2:
             open_cutoff = latest.virtual_time - timedelta(milliseconds=config.min_open_window_ms)
             open_window_samples = [s for s in contiguous_samples if s.virtual_time >= open_cutoff]
-            if open_window_samples:
+            if len(open_window_samples) >= 2:
                 open_count = sum(1 for s in open_window_samples if not s.eyes_closed)
                 open_ratio = open_count / len(open_window_samples)
                 if open_ratio >= config.min_valid_frame_ratio:
