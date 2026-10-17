@@ -1,6 +1,6 @@
 """SIMULATION ONLY — NOT FOR OPERATIONAL AVIATION USE."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from app.contracts.enums import (
@@ -27,8 +27,13 @@ class DeterministicSentinelAgent:
     retained identical, still-valid incident before a later ATC approval. The
     current orchestrator does not perform that reconnect handoff.
 
-    Command-ID replay protection remains an orchestrator responsibility until
-    Phase 2. Evidence UUIDs are references, not independently verified evidence;
+    Consumed commands are retained as normalized JSON for this reset lifecycle;
+    the orchestrator separately owns durable API idempotency. Command time must
+    be at or after incident creation and its first accepted observation. Later
+    redelivery does not move that threshold. No clock is supplied to decide(),
+    so future dating and maximum age cannot be independently checked here.
+
+    Evidence UUIDs are references, not independently verified evidence;
     v1 supplies neither fallback prerequisites nor recovery/failure callbacks.
     Guardian recovery cannot revoke the retained incident through this Protocol.
     The orchestrator must enforce current incident validity before calling decide.
@@ -50,6 +55,8 @@ class DeterministicSentinelAgent:
         self._incident: GuardianIncident | None = None
         self._pending: SentinelDecision | None = None
         self._authorization: SentinelDecision | None = None
+        self._incident_observed_at: datetime | None = None
+        self._consumed_commands: dict[UUID, str] = {}
 
     @property
     def state(self) -> SentinelState:
@@ -75,6 +82,8 @@ class DeterministicSentinelAgent:
         self._incident = None
         self._pending = None
         self._authorization = None
+        self._incident_observed_at = None
+        self._consumed_commands.clear()
         self._state = SentinelState.STANDBY
 
     def on_incident(self, incident: GuardianIncident, observed_at: datetime) -> SentinelDecision:
@@ -91,6 +100,11 @@ class DeterministicSentinelAgent:
             raise ValueError("incident delivery cannot reopen a running or terminal lifecycle")
         if self._incident is not None and candidate != self._incident:
             raise ValueError("Sentinel rejected conflicting active incident replacement")
+        if not isinstance(observed_at, datetime) or observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be a timezone-aware datetime")
+        observed_at = observed_at.astimezone(timezone.utc)
+        if observed_at < candidate.created_at:
+            raise ValueError("incident observation cannot precede incident creation")
         if self._pending is not None:
             return self._pending.model_copy(deep=True)
 
@@ -114,6 +128,8 @@ class DeterministicSentinelAgent:
         )
         self._transition(target)
         self._incident = candidate
+        if self._incident_observed_at is None:
+            self._incident_observed_at = observed_at
         self._pending = pending
         return pending.model_copy(deep=True)
 
@@ -121,6 +137,14 @@ class DeterministicSentinelAgent:
         if not isinstance(decision, ATCDecision):
             raise ValueError("Sentinel requires a canonical ATCDecision")
         candidate = ATCDecision.model_validate(decision.model_dump())
+        request_content = candidate.model_dump_json()
+        # Integrity checks precede context checks so changed run/incident fields
+        # under an already consumed ID are reported as identity conflicts too.
+        consumed = self._consumed_commands.get(candidate.command_id)
+        if consumed is not None:
+            if consumed != request_content:
+                raise ValueError("Sentinel command_id conflict: consumed ID has different content")
+            raise ValueError("Sentinel replayed command_id: already consumed; not awaiting another authorization")
         self._require_run(candidate.scenario_run_id)
         if self._incident is None:
             raise ValueError("Sentinel has no active incident")
@@ -131,6 +155,12 @@ class DeterministicSentinelAgent:
         approved = candidate.decision == ATCDecisionType.APPROVE
         if approved and candidate.requested_action == SimulatorActionType.NO_OP:
             raise ValueError("APPROVE must request a non-NO_OP symbolic action")
+        if self._incident_observed_at is None:
+            raise ValueError("Sentinel has no accepted incident observation time")
+        if candidate.issued_at < self._incident.created_at:
+            raise ValueError("ATC decision cannot precede incident creation")
+        if candidate.issued_at < self._incident_observed_at:
+            raise ValueError("ATC decision cannot precede first accepted incident observation")
         result = SentinelDecision(
             decision_id=uuid4(),
             scenario_run_id=candidate.scenario_run_id,
@@ -139,7 +169,7 @@ class DeterministicSentinelAgent:
             action_type=candidate.requested_action if approved else SimulatorActionType.NO_OP,
             authorization_source=AuthorizationSource.SIMULATED_ATC,
             reason=(
-                "Simulated ATC APPROVE matched the active run and incident."
+                "Unused simulated ATC APPROVE matched the active run, incident and event-time ordering."
                 if approved
                 else "Simulated ATC rejected the requested action; no action authorized."
             ),
@@ -147,10 +177,13 @@ class DeterministicSentinelAgent:
             executed_at=candidate.issued_at,
             result=DecisionResult.APPROVED if approved else DecisionResult.REJECTED,
         )
+        # Prepare all copies before committing bookkeeping or lifecycle changes.
+        authorization = result.model_copy(deep=True) if approved else None
         if approved:
             self._transition(SentinelState.SIM_ACTION_RUNNING)
-            self._authorization = result.model_copy(deep=True)
+            self._authorization = authorization
             self._pending = None
+        self._consumed_commands[candidate.command_id] = request_content
         return result
 
     def set_atc_link(self, scenario_run_id: UUID, connected: bool) -> None:
