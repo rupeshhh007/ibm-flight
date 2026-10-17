@@ -90,6 +90,13 @@ class VisionConfig:
             if not isinstance(val, (int, float)) or math.isnan(val) or math.isinf(val):
                 raise ValueError(f"{name} must be a finite number")
 
+        # Validate that pilot_channels keys match each PilotChannelConfig's pilot_id
+        for pid, ch in self.pilot_channels.items():
+            if pid != ch.pilot_id:
+                raise ValueError(
+                    f"pilot_channels key '{pid}' does not match PilotChannelConfig.pilot_id '{ch.pilot_id}'"
+                )
+
         if not (0.0 < self.min_usable_quality <= 1.0):
             raise ValueError("min_usable_quality must be strictly positive in (0.0, 1.0]")
         if not (0.0 < self.min_face_confidence <= 1.0):

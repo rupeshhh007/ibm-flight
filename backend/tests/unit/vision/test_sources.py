@@ -334,3 +334,81 @@ def test_opencv_capture_source_read_failure_invalidates_latest_frame(base_time: 
         assert sample.is_usable is False
         assert sample.face_visible is False
         source.close()
+
+
+# =====================================================================
+# Review Finding Regressions: Pilot Source Identity & Frame Tracking
+# =====================================================================
+
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
+def test_opencv_capture_source_mismatched_video_file(base_time: datetime) -> None:
+    """
+    P2 Regression Test:
+    OpenCVCaptureSource configured with fileA.mp4 must not supply observations
+    for a pilot channel configured for fileB.mp4.
+    """
+    with patch("cv2.VideoCapture") as mock_cap_cls:
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (False, None)
+        mock_cap_cls.return_value = mock_cap
+
+        source = OpenCVCaptureSource("pilot1_feed.mp4")
+        config = VisionConfig(
+            pilot_channels={
+                PilotId.PILOT_1: PilotChannelConfig(
+                    pilot_id=PilotId.PILOT_1,
+                    video_path="pilot2_feed.mp4",
+                ),
+                PilotId.PILOT_2: PilotChannelConfig(
+                    pilot_id=PilotId.PILOT_2,
+                    video_path="pilot1_feed.mp4",
+                ),
+            }
+        )
+        sample = source.get_sample(PilotId.PILOT_1, base_time, config)
+        assert sample.camera_available is False
+        assert sample.is_usable is False
+        assert sample.error_reason == "channel_video_path_mismatch"
+        source.close()
+
+
+@pytest.mark.skipif(not _CV_DEPS_AVAILABLE, reason="Optional opencv-contrib-python and numpy not installed")
+def test_opencv_capture_source_pilot_specific_frame_tracking(base_time: datetime) -> None:
+    """
+    P1 Regression Test:
+    Ensure frame tracking is pilot-specific so observing Pilot 1 does not incorrectly
+    consume or lock out Pilot 2's frame on a shared split camera.
+    """
+    import numpy as np
+
+    with patch("cv2.VideoCapture") as mock_cap_cls:
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (False, None)
+        mock_cap_cls.return_value = mock_cap
+
+        source = OpenCVCaptureSource(0)
+        rng = np.random.default_rng(42)
+        frame = rng.integers(100, 140, size=(480, 640, 3), dtype=np.uint8)
+
+        # Inject frame 10
+        with source._lock:
+            source._latest_frame = frame
+            source._latest_mono = time.monotonic()
+            source._latest_frame_id = 10
+
+        config = VisionConfig.split_frame()
+
+        # Pilot 1 observes frame 10
+        s1 = source.get_sample(PilotId.PILOT_1, base_time, config)
+        assert source._last_served_frame_id[PilotId.PILOT_1] == 10
+
+        # Pilot 2 also observes frame 10 without being blocked or consumed by Pilot 1
+        s2 = source.get_sample(PilotId.PILOT_2, base_time, config)
+        assert source._last_served_frame_id[PilotId.PILOT_2] == 10
+
+        # Both received the valid frame identity
+        assert s1.frame_id == 10
+        assert s2.frame_id == 10
+        source.close()

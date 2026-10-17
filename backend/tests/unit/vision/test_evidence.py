@@ -782,3 +782,252 @@ def test_config_requires_rois_when_pilots_share_source() -> None:
                 PilotId.PILOT_2: PilotChannelConfig(pilot_id=PilotId.PILOT_2, camera_index=0, roi=None, enabled=True),
             }
         )
+
+
+# =====================================================================
+# Review Finding Regressions: Evidence Integrity & Precision
+# =====================================================================
+
+def test_missing_ear_fails_closed_cannot_become_possibly_unresponsive(
+    base_time: datetime,
+    config: VisionConfig,
+) -> None:
+    """
+    P1 Regression Test:
+    Missing EAR (ear=None) must independently fail closed.
+    Even with eyes_closed=True, quality=0.95, and usable-looking frames repeated
+    over 4.5 seconds, the evidence window must NEVER produce POSSIBLY_UNRESPONSIVE.
+    """
+    # 1. PilotFrameEvidence.__post_init__ fails closed if eyes_closed=True with ear=None
+    pfe = PilotFrameEvidence(
+        virtual_time=base_time,
+        monotonic_capture_time=100.0,
+        camera_available=True,
+        face_visible=True,
+        eyes_closed=True,
+        ear=None,
+        quality=0.95,
+        is_usable=True,
+    )
+    assert pfe.is_usable is False
+    assert pfe.error_reason == "missing_eye_geometry"
+
+    # 2. A window of repeated usable-looking frames where ear=None cannot become POSSIBLY_UNRESPONSIVE
+    window_natural = PilotEvidenceWindow()
+    for i in range(10):
+        t = base_time + timedelta(milliseconds=i * 500)
+        window_natural.add_sample(
+            PilotFrameEvidence(
+                virtual_time=t,
+                monotonic_capture_time=100.0 + i * 0.5,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=True,
+                ear=None,
+                quality=0.95,
+                is_usable=True,
+                frame_id=i + 1,
+            )
+        )
+    eval_time = base_time + timedelta(milliseconds=4500)
+    obs_natural = window_natural.evaluate(PilotId.PILOT_1, eval_time, config)
+    assert obs_natural.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs_natural.observation_status != PilotObservationStatus.POSSIBLY_UNRESPONSIVE
+    assert obs_natural.eyes_closed is False
+    assert obs_natural.observation_duration_ms == 0
+
+    # 3. Even if someone forcibly overrides is_usable=True into the window,
+    # the evaluator's closed_run independently rejects ear=None and refuses to trigger POSSIBLY_UNRESPONSIVE.
+    window_forced = PilotEvidenceWindow()
+    for i in range(10):
+        t = base_time + timedelta(milliseconds=i * 500)
+        sample = PilotFrameEvidence(
+            virtual_time=t,
+            monotonic_capture_time=100.0 + i * 0.5,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=None,
+            quality=0.95,
+            is_usable=True,
+            frame_id=i + 1,
+        )
+        object.__setattr__(sample, "is_usable", True)
+        window_forced.add_sample(sample)
+
+    obs_forced = window_forced.evaluate(PilotId.PILOT_1, eval_time, config)
+    assert obs_forced.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs_forced.observation_status != PilotObservationStatus.POSSIBLY_UNRESPONSIVE
+    assert obs_forced.eyes_closed is False
+
+
+def test_physical_frame_reuse_cannot_accumulate_temporal_duration(
+    base_time: datetime,
+    config: VisionConfig,
+) -> None:
+    """
+    P1 Regression Test:
+    A single physical frame reused across several virtual timestamps spanning 5 seconds
+    must NOT accumulate independent temporal duration or trigger POSSIBLY_UNRESPONSIVE.
+    """
+    window = PilotEvidenceWindow()
+    # Physical frame captured once at monotonic time 100.0 with frame_id=101
+    static_frame_id = 101
+    static_mono = 100.0
+
+    # Virtual time advances by 1 second each step across 6 observations (0s to 5s)
+    for i in range(6):
+        t = base_time + timedelta(seconds=i)
+        sample = PilotFrameEvidence(
+            virtual_time=t,
+            monotonic_capture_time=static_mono,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.12,
+            quality=0.95,
+            is_usable=True,
+            frame_id=static_frame_id,
+        )
+        window.add_sample(sample)
+
+    eval_time = base_time + timedelta(seconds=5)
+    obs = window.evaluate(PilotId.PILOT_1, eval_time, config)
+
+    # The single physical frame represents only 1 instantaneous capture (distinct frames = 1).
+    # It must not accumulate 5 seconds of duration or infer sustained eye closure!
+    assert obs.observation_status == PilotObservationStatus.UNKNOWN
+    assert obs.observation_status != PilotObservationStatus.POSSIBLY_UNRESPONSIVE
+    assert obs.observation_duration_ms == 0
+
+
+def test_distinct_physical_frames_accumulate_temporal_duration(
+    base_time: datetime,
+    config: VisionConfig,
+) -> None:
+    """
+    Verify that when physical frames DO advance with distinct frame IDs / capture times,
+    independent temporal evidence accumulates and triggers POSSIBLY_UNRESPONSIVE after min_closed_window_ms.
+    """
+    window = PilotEvidenceWindow()
+    # 5 distinct physical frames advancing at 1-second intervals (0s to 4s)
+    for i in range(5):
+        t = base_time + timedelta(seconds=i)
+        sample = PilotFrameEvidence(
+            virtual_time=t,
+            monotonic_capture_time=100.0 + i,
+            camera_available=True,
+            face_visible=True,
+            eyes_closed=True,
+            ear=0.12,
+            quality=0.95,
+            is_usable=True,
+            frame_id=i + 1,
+        )
+        window.add_sample(sample)
+
+    eval_time = base_time + timedelta(seconds=4)
+    obs = window.evaluate(PilotId.PILOT_1, eval_time, config)
+
+    assert obs.observation_status == PilotObservationStatus.POSSIBLY_UNRESPONSIVE
+    assert obs.observation_duration_ms >= config.min_closed_window_ms
+    assert obs.eyes_closed is True
+
+
+def test_pilot_channels_swapped_id_validation() -> None:
+    """
+    P2 Regression Test:
+    Validate that pilot_channels keys must match each PilotChannelConfig's pilot_id.
+    Swapped IDs must be rejected by VisionConfig validation.
+    """
+    from app.modules.vision.geometry import NormalizedROI
+
+    with pytest.raises(ValueError, match="pilot_channels key .* does not match"):
+        VisionConfig(
+            pilot_channels={
+                PilotId.PILOT_1: PilotChannelConfig(
+                    pilot_id=PilotId.PILOT_2,
+                    roi=NormalizedROI(0.0, 0.0, 0.5, 1.0),
+                    enabled=True,
+                ),
+                PilotId.PILOT_2: PilotChannelConfig(
+                    pilot_id=PilotId.PILOT_1,
+                    roi=NormalizedROI(0.5, 0.0, 1.0, 1.0),
+                    enabled=True,
+                ),
+            }
+        )
+
+
+def test_quality_threshold_precision_near_80_and_805(
+    base_time: datetime,
+    config: VisionConfig,
+) -> None:
+    """
+    P2 Regression Test:
+    Avoid rounding raw observation quality upward before Guardian evaluates its minimum evidence-quality threshold.
+    Test near 0.80 (e.g. 0.796 does not round up to 0.80) and higher-precision thresholds including 0.805.
+    """
+    # 1. Raw quality 0.796: in older 2-digit rounding, round(0.796, 2) became 0.80 (rounding upward).
+    # With raw precision preserved, 0.796 must stay 0.796 and fail a >= 0.80 threshold.
+    window_796 = PilotEvidenceWindow()
+    for i in range(5):
+        t = base_time + timedelta(seconds=i)
+        window_796.add_sample(
+            PilotFrameEvidence(
+                virtual_time=t,
+                monotonic_capture_time=100.0 + i,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=True,
+                ear=0.12,
+                quality=0.796,
+                is_usable=True,
+                frame_id=i + 1,
+            )
+        )
+    obs_796 = window_796.evaluate(PilotId.PILOT_1, base_time + timedelta(seconds=4), config)
+    assert obs_796.observation_quality == pytest.approx(0.796, abs=1e-5)
+    assert obs_796.observation_quality < 0.80
+
+    # 2. Raw quality 0.804 vs 0.805 threshold:
+    window_804 = PilotEvidenceWindow()
+    for i in range(5):
+        t = base_time + timedelta(seconds=i)
+        window_804.add_sample(
+            PilotFrameEvidence(
+                virtual_time=t,
+                monotonic_capture_time=100.0 + i,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=True,
+                ear=0.12,
+                quality=0.804,
+                is_usable=True,
+                frame_id=i + 1,
+            )
+        )
+    obs_804 = window_804.evaluate(PilotId.PILOT_1, base_time + timedelta(seconds=4), config)
+    assert obs_804.observation_quality == pytest.approx(0.804, abs=1e-5)
+    assert obs_804.observation_quality < 0.805
+
+    # 3. Raw quality 0.805: meets >= 0.805 threshold
+    window_805 = PilotEvidenceWindow()
+    for i in range(5):
+        t = base_time + timedelta(seconds=i)
+        window_805.add_sample(
+            PilotFrameEvidence(
+                virtual_time=t,
+                monotonic_capture_time=100.0 + i,
+                camera_available=True,
+                face_visible=True,
+                eyes_closed=True,
+                ear=0.12,
+                quality=0.805,
+                is_usable=True,
+                frame_id=i + 1,
+            )
+        )
+    obs_805 = window_805.evaluate(PilotId.PILOT_1, base_time + timedelta(seconds=4), config)
+    assert obs_805.observation_quality == pytest.approx(0.805, abs=1e-5)
+    assert obs_805.observation_quality >= 0.805

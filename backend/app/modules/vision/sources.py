@@ -106,6 +106,7 @@ class ReplayLandmarkSource:
 
     def __init__(self) -> None:
         self._scenario_id: str = "normal_flight"
+        self._frame_seq: int = 0
         self._custom_tracks: dict[PilotId, list[PilotFrameEvidence]] = {
             PilotId.PILOT_1: [],
             PilotId.PILOT_2: [],
@@ -149,6 +150,8 @@ class ReplayLandmarkSource:
             virtual_time = virtual_time.astimezone(timezone.utc)
 
         now_mono = time.monotonic()
+        self._frame_seq += 1
+        frame_id = f"replay_{pilot_id.value}_{self._frame_seq}"
 
         if self._closed:
             return PilotFrameEvidence(
@@ -161,6 +164,7 @@ class ReplayLandmarkSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="source_closed",
+                frame_id=frame_id,
             )
 
         # Invariant: Channel must be explicitly configured and enabled
@@ -176,6 +180,7 @@ class ReplayLandmarkSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="channel_disabled_or_unassigned",
+                frame_id=frame_id,
             )
 
         # Check for injected custom generator
@@ -202,6 +207,7 @@ class ReplayLandmarkSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="camera_obstructed",
+                frame_id=frame_id,
             )
 
         if self._scenario_id in {"dual_pilot_atc_connected", "dual_pilot_atc_disconnected"}:
@@ -217,6 +223,7 @@ class ReplayLandmarkSource:
                 quality=0.92,
                 is_usable=True,
                 error_reason=None,
+                frame_id=frame_id,
             )
 
         if self._scenario_id == "single_pilot_unresponsive":
@@ -232,6 +239,7 @@ class ReplayLandmarkSource:
                     quality=0.92,
                     is_usable=True,
                     error_reason=None,
+                    frame_id=frame_id,
                 )
             else:
                 # Responsive open eyes for Pilot 2
@@ -245,6 +253,7 @@ class ReplayLandmarkSource:
                     quality=0.95,
                     is_usable=True,
                     error_reason=None,
+                    frame_id=frame_id,
                 )
 
         # normal_flight default
@@ -258,6 +267,7 @@ class ReplayLandmarkSource:
             quality=0.95,
             is_usable=True,
             error_reason=None,
+            frame_id=frame_id,
         )
 
     def close(self) -> None:
@@ -296,6 +306,10 @@ class OpenCVCaptureSource:
         self._lock = threading.Lock()
         self._latest_frame = None
         self._latest_mono: float = 0.0
+        self._frame_seq: int = 0
+        self._latest_frame_id: int = 0
+        self._last_served_frame_id: dict[PilotId, int] = {}
+        self._last_served_mono: dict[PilotId, float] = {}
         self._running: bool = True
         self._thread = threading.Thread(target=self._capture_worker, daemon=True)
         self._thread.start()
@@ -317,20 +331,12 @@ class OpenCVCaptureSource:
                             ret, frame = res
                             if ret and frame is not None:
                                 with self._lock:
+                                    self._frame_seq += 1
                                     self._latest_frame = frame
                                     self._latest_mono = time.monotonic()
-                            else:
-                                with self._lock:
-                                    self._latest_frame = None
-                        else:
-                            with self._lock:
-                                self._latest_frame = None
-                    else:
-                        with self._lock:
-                            self._latest_frame = None
+                                    self._latest_frame_id = self._frame_seq
                 except Exception:
-                    with self._lock:
-                        self._latest_frame = None
+                    pass
             time.sleep(delay)
 
     def configure_scenario(self, scenario_id: str) -> None:
@@ -360,19 +366,49 @@ class OpenCVCaptureSource:
                 error_reason="channel_disabled_or_unassigned",
             )
 
-        # Verify camera index mapping matches this source instance
-        if isinstance(self._target, int) and channel.camera_index is not None and channel.camera_index != self._target:
-            return PilotFrameEvidence(
-                virtual_time=virtual_time,
-                monotonic_capture_time=now_mono,
-                camera_available=False,
-                face_visible=False,
-                eyes_closed=False,
-                ear=None,
-                quality=0.0,
-                is_usable=False,
-                error_reason="channel_camera_mismatch",
-            )
+        # Strict source identity validation: verify channel configuration matches this source
+        if channel.camera_index is not None:
+            if self._target != channel.camera_index:
+                return PilotFrameEvidence(
+                    virtual_time=virtual_time,
+                    monotonic_capture_time=now_mono,
+                    camera_available=False,
+                    face_visible=False,
+                    eyes_closed=False,
+                    ear=None,
+                    quality=0.0,
+                    is_usable=False,
+                    error_reason="channel_camera_mismatch",
+                )
+        elif channel.video_path is not None:
+            source_path = str(Path(self._target)) if isinstance(self._target, (str, Path)) else str(self._target)
+            expected_path = str(Path(channel.video_path))
+            if source_path != expected_path:
+                return PilotFrameEvidence(
+                    virtual_time=virtual_time,
+                    monotonic_capture_time=now_mono,
+                    camera_available=False,
+                    face_visible=False,
+                    eyes_closed=False,
+                    ear=None,
+                    quality=0.0,
+                    is_usable=False,
+                    error_reason="channel_video_path_mismatch",
+                )
+        else:
+            # Channel has neither camera_index nor video_path, implying default camera 0
+            if self._target != 0:
+                return PilotFrameEvidence(
+                    virtual_time=virtual_time,
+                    monotonic_capture_time=now_mono,
+                    camera_available=False,
+                    face_visible=False,
+                    eyes_closed=False,
+                    ear=None,
+                    quality=0.0,
+                    is_usable=False,
+                    error_reason="channel_camera_mismatch",
+                )
 
         if not self._cap or not self._cap.isOpened():
             return PilotFrameEvidence(
@@ -390,6 +426,12 @@ class OpenCVCaptureSource:
         with self._lock:
             frame = self._latest_frame
             frame_mono = self._latest_mono
+            frame_id = self._latest_frame_id
+
+        # Pilot-specific tracking: record that this frame was served to pilot_id
+        # (Pilot 1 observing this frame does not consume Pilot 2's frame)
+        self._last_served_frame_id[pilot_id] = frame_id
+        self._last_served_mono[pilot_id] = frame_mono
 
         if frame is None:
             return PilotFrameEvidence(
@@ -402,6 +444,7 @@ class OpenCVCaptureSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="no_frame_captured_yet",
+                frame_id=frame_id,
             )
 
         # Check frame staleness against max_frame_age_ms
@@ -417,6 +460,7 @@ class OpenCVCaptureSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="stale_frame",
+                frame_id=frame_id,
             )
 
         # Isolate pilot ROI: crop frame to the assigned sub-region
@@ -437,6 +481,7 @@ class OpenCVCaptureSource:
                     quality=0.0,
                     is_usable=False,
                     error_reason="invalid_or_empty_roi",
+                    frame_id=frame_id,
                 )
             pilot_frame = frame[y1:y2, x1:x2]
         else:
@@ -460,6 +505,7 @@ class OpenCVCaptureSource:
                     quality=0.0,
                     is_usable=False,
                     error_reason="unassigned_roi_on_shared_camera",
+                    frame_id=frame_id,
                 )
             pilot_frame = frame
 
@@ -480,6 +526,7 @@ class OpenCVCaptureSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="poor_illumination",
+                frame_id=frame_id,
             )
 
         # Check blur
@@ -494,6 +541,7 @@ class OpenCVCaptureSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="severe_blur",
+                frame_id=frame_id,
             )
 
         # Invariant 1: Verified face detection is mandatory.
@@ -511,6 +559,7 @@ class OpenCVCaptureSource:
                     quality=0.0,
                     is_usable=False,
                     error_reason=err or "no_face_detected_in_roi",
+                    frame_id=frame_id,
                 )
 
             # Evaluate landmark quality
@@ -526,6 +575,7 @@ class OpenCVCaptureSource:
                     quality=lmk_quality,
                     is_usable=False,
                     error_reason="sub_threshold_landmark_quality",
+                    frame_id=frame_id,
                 )
 
             left_ear, right_ear, avg_ear = extract_ear_from_landmarks(landmarks)
@@ -540,6 +590,7 @@ class OpenCVCaptureSource:
                     quality=0.0,
                     is_usable=False,
                     error_reason="invalid_or_incomplete_eye_geometry",
+                    frame_id=frame_id,
                 )
 
             eyes_closed = avg_ear < config.eye_closed_ear_threshold
@@ -554,6 +605,7 @@ class OpenCVCaptureSource:
                 quality=lmk_quality,
                 is_usable=True,
                 error_reason=None,
+                frame_id=frame_id,
             )
         else:
             # Without verified face detection running on the frame, fail-closed as UNKNOWN
@@ -567,6 +619,7 @@ class OpenCVCaptureSource:
                 quality=0.0,
                 is_usable=False,
                 error_reason="no_verified_face_detection_available",
+                frame_id=frame_id,
             )
 
     def close(self) -> None:

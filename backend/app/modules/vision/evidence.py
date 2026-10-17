@@ -34,6 +34,7 @@ class PilotFrameEvidence:
     quality: float
     is_usable: bool
     error_reason: str | None = None
+    frame_id: int | str | None = None
 
     def __post_init__(self) -> None:
         # Guarantee timezone-aware UTC datetime
@@ -63,6 +64,13 @@ class PilotFrameEvidence:
                 object.__setattr__(self, "ear", None)
                 object.__setattr__(self, "is_usable", False)
                 object.__setattr__(self, "error_reason", "invalid_numeric_ear")
+
+        # Independent fail-closed invariant: Eye geometry (ear) is mandatory for closed-eye evidence.
+        # An observation cannot assert closed eyes if eye geometry is missing.
+        if self.eyes_closed and self.ear is None:
+            object.__setattr__(self, "is_usable", False)
+            if not self.error_reason:
+                object.__setattr__(self, "error_reason", "missing_eye_geometry")
 
 
 class PilotEvidenceWindow:
@@ -189,7 +197,7 @@ class PilotEvidenceWindow:
                 face_visible=True,
                 eyes_closed=False,
                 observation_duration_ms=0,
-                observation_quality=max(0.0, min(1.0, round(q, 2))),
+                observation_quality=max(0.0, min(1.0, float(q))),
             )
 
         # 6. Compute general contiguous usable duration and quality
@@ -204,18 +212,30 @@ class PilotEvidenceWindow:
             contiguous_samples.append(s)
             curr_t = s.virtual_time
 
-        if len(contiguous_samples) < 2:
+        # Filter contiguous samples to distinct physical frames to prevent repeated frames
+        # from inflating evidence duration.
+        distinct_contiguous: list[PilotFrameEvidence] = []
+        seen_contiguous_frames: set[object] = set()
+        for s in contiguous_samples:
+            frame_key = s.frame_id if s.frame_id is not None else s.monotonic_capture_time
+            if frame_key not in seen_contiguous_frames:
+                seen_contiguous_frames.add(frame_key)
+                distinct_contiguous.append(s)
+
+        if len(distinct_contiguous) < 2:
             duration_ms = 0
         else:
-            duration_ms = int((latest.virtual_time - contiguous_samples[-1].virtual_time).total_seconds() * 1000.0)
+            duration_ms = int((distinct_contiguous[0].virtual_time - distinct_contiguous[-1].virtual_time).total_seconds() * 1000.0)
             duration_ms = max(0, min(600_000, duration_ms))
 
         mean_q = sum(s.quality for s in contiguous_samples) / max(1, len(contiguous_samples))
-        bounded_q = max(0.0, min(1.0, round(mean_q, 2)))
+        # Exact bounded float precision: do not round upward before Guardian threshold evaluation
+        bounded_q = max(0.0, min(1.0, float(mean_q)))
 
         # 7. Independent sustained temporal evidence evaluation
-        # Disambiguate latest sample: must satisfy strict thresholds, not ambiguous region
-        is_latest_closed = latest.eyes_closed and (latest.ear is None or latest.ear < config.eye_closed_ear_threshold)
+        # Disambiguate latest sample: must satisfy strict thresholds.
+        # Fail closed: eye geometry (ear) is strictly required for closed-eye classification.
+        is_latest_closed = latest.eyes_closed and (latest.ear is not None and latest.ear < config.eye_closed_ear_threshold)
         is_latest_open = (not latest.eyes_closed) and (latest.ear is not None and latest.ear >= config.eye_open_ear_threshold)
 
         # Evaluate sustained closed-eye window for POSSIBLY_UNRESPONSIVE
@@ -228,21 +248,31 @@ class PilotEvidenceWindow:
                 gap_ms = (curr_t - s.virtual_time).total_seconds() * 1000.0
                 if s is not latest and (gap_ms <= 0.0 or gap_ms > config.max_gap_ms):
                     break
-                # Broken by confirmed open sample or ambiguous sample (ear >= eye_closed_ear_threshold)
-                if not s.eyes_closed or (s.ear is not None and s.ear >= config.eye_closed_ear_threshold):
+                # Fail-closed: missing eye geometry (ear is None), ambiguous ear, or open eyes immediately breaks run
+                if not s.eyes_closed or s.ear is None or s.ear >= config.eye_closed_ear_threshold:
                     break
                 closed_run.append(s)
                 curr_t = s.virtual_time
 
-            if len(closed_run) >= 2:
-                closed_span_ms = int((latest.virtual_time - closed_run[-1].virtual_time).total_seconds() * 1000.0)
+            # Enforce physical frame independence: filter to distinct physical frames
+            distinct_closed: list[PilotFrameEvidence] = []
+            seen_closed_frames: set[object] = set()
+            for s in closed_run:
+                frame_key = s.frame_id if s.frame_id is not None else s.monotonic_capture_time
+                if frame_key not in seen_closed_frames:
+                    seen_closed_frames.add(frame_key)
+                    distinct_closed.append(s)
+
+            if len(distinct_closed) >= 2:
+                # Span between latest distinct physical frame and earliest distinct physical frame
+                closed_span_ms = int((distinct_closed[0].virtual_time - distinct_closed[-1].virtual_time).total_seconds() * 1000.0)
                 if (
                     closed_span_ms >= config.min_closed_window_ms
                     and closed_span_ms >= config.min_observation_duration_ms
                 ):
                     closed_count = sum(
                         1 for s in closed_run
-                        if s.eyes_closed and (s.ear is None or s.ear < config.eye_closed_ear_threshold)
+                        if s.eyes_closed and s.ear is not None and s.ear < config.eye_closed_ear_threshold
                     )
                     closed_ratio = closed_count / len(closed_run)
                     if closed_ratio >= config.min_valid_frame_ratio:
@@ -255,7 +285,7 @@ class PilotEvidenceWindow:
                             face_visible=True,
                             eyes_closed=True,
                             observation_duration_ms=closed_span_ms,
-                            observation_quality=max(0.0, min(1.0, round(mean_closed_q, 2))),
+                            observation_quality=max(0.0, min(1.0, float(mean_closed_q))),
                         )
 
         # Evaluate sustained open-eye window for RESPONSIVE
@@ -274,8 +304,18 @@ class PilotEvidenceWindow:
                 open_run.append(s)
                 curr_t = s.virtual_time
 
-            if len(open_run) >= 2:
-                open_span_ms = int((latest.virtual_time - open_run[-1].virtual_time).total_seconds() * 1000.0)
+            # Enforce physical frame independence: filter to distinct physical frames
+            distinct_open: list[PilotFrameEvidence] = []
+            seen_open_frames: set[object] = set()
+            for s in open_run:
+                frame_key = s.frame_id if s.frame_id is not None else s.monotonic_capture_time
+                if frame_key not in seen_open_frames:
+                    seen_open_frames.add(frame_key)
+                    distinct_open.append(s)
+
+            if len(distinct_open) >= 2:
+                # Span between latest distinct physical frame and earliest distinct physical frame
+                open_span_ms = int((distinct_open[0].virtual_time - distinct_open[-1].virtual_time).total_seconds() * 1000.0)
                 if (
                     open_span_ms >= config.min_open_window_ms
                     and open_span_ms >= config.min_observation_duration_ms
@@ -295,17 +335,19 @@ class PilotEvidenceWindow:
                             face_visible=True,
                             eyes_closed=False,
                             observation_duration_ms=open_span_ms,
-                            observation_quality=max(0.0, min(1.0, round(mean_open_q, 2))),
+                            observation_quality=max(0.0, min(1.0, float(mean_open_q))),
                         )
 
         # Ambiguous, sub-duration, or fluctuating cues -> safe UNKNOWN
+        # Fail-closed: eyes_closed cannot be asserted without valid eye geometry (ear is not None)
+        safe_eyes_closed = latest.eyes_closed if latest.ear is not None else False
         return PilotObservation(
             pilot_id=pilot_id,
             observed_at=observed_at,
             observation_status=PilotObservationStatus.UNKNOWN,
             camera_available=True,
             face_visible=True,
-            eyes_closed=latest.eyes_closed,
+            eyes_closed=safe_eyes_closed,
             observation_duration_ms=duration_ms,
             observation_quality=bounded_q,
         )
