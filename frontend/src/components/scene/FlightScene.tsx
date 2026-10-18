@@ -343,7 +343,7 @@ export function FlightScene({
           <circle cx={incident.x} cy={incident.y} r={34} className="scene__incident-ring scene__incident-ring--b" />
           <path d={`M${incident.x} ${incident.y - 16} L${incident.x + 15} ${incident.y + 11} L${incident.x - 15} ${incident.y + 11} Z`} className="scene__incident-tri" />
           <text x={incident.x} y={incident.y + 7} textAnchor="middle" className="scene__incident-bang">!</text>
-          <g transform={`translate(${incident.x - 300} ${incident.y - 100})`}>
+          <g className="scene__incident-label" transform={`translate(${incident.x - 300} ${incident.y - 100})`}>
             <rect width="282" height="56" rx="4" className="scene__incident-box" />
             <text x="14" y="24" className="scene__incident-title">INCIDENT ZONE</text>
             <text x="14" y="43" className="scene__incident-sub">

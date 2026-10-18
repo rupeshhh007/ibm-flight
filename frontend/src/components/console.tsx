@@ -292,7 +292,7 @@ export function LinkScene({ connected, emergency, aircraftId }: { connected: boo
       {/* link arc */}
       <path d="M180 110 Q 400 -10 620 120" className="link-scene__arc" />
       <g transform="translate(400 48)">
-        <rect x="-74" y="-14" width="148" height="26" rx="3" className="link-scene__badge" />
+        <rect x="-100" y="-17" width="200" height="32" rx="3" className="link-scene__badge" />
         <text x="0" y="4" textAnchor="middle" className="link-scene__badge-text">{connected ? "SIMULATED LINK" : "LINK DOWN"}</text>
       </g>
       {/* aircraft */}
