@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
-from datetime import timezone
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
@@ -14,6 +16,7 @@ from app.contracts.enums import (
     DecisionResult,
     EventSource,
     EventType,
+    GuardianState,
     PilotId,
     SentinelState,
     SimulatorActionType,
@@ -46,6 +49,7 @@ from app.contracts.models import (
     ScenarioResetRequest,
     ScenarioStartRequest,
     ScenarioStartedPayload,
+    SimulatorActionPayload,
     SentinelDecision,
     StoredEvent,
     SystemSnapshot,
@@ -53,6 +57,9 @@ from app.contracts.models import (
 from app.core.clock import VirtualClock
 from app.scenarios.catalog import get_scenario, list_scenarios
 from app.scenarios.runner import ScenarioRunner
+
+
+logger = logging.getLogger(__name__)
 
 
 class DomainError(Exception):
@@ -84,6 +91,9 @@ class Orchestrator:
         self._lock = threading.RLock()
         self._runner: ScenarioRunner | None = None
         self._incidents: list[GuardianIncident] = []
+        # Tracks incidents actually delivered to Sentinel in this run. A Guardian
+        # recovery must invalidate this grant even if Sentinel lacks revocation.
+        self._sentinel_admitted_incident_id: UUID | None = None
         now = self.clock.now()
         self._snapshot = SystemSnapshot(
             pilots=[PilotSnapshot(pilot_id=PilotId.PILOT_1), PilotSnapshot(pilot_id=PilotId.PILOT_2)],
@@ -112,6 +122,38 @@ class Orchestrator:
         prior = CommandResponse.model_validate_json(record.result_json)
         return prior.model_copy(update={"duplicate": True, "message": f"Duplicate command: {prior.message}"})
 
+    def _reject_unrecorded_atc_replay(self, request: ATCDecision, fingerprint: str) -> None:
+        """Fail closed on a durable ATC intent lacking a cached command result.
+
+        The existing EventStore Protocol exposes only paginated replay, not an
+        atomic command/outcome transaction. Never repeat a symbolic side effect
+        solely because record_command or the later audit append failed.
+        """
+        after_seq = 0
+        while True:
+            batch = self.store.read_after(after_seq, 500)
+            if not batch:
+                return
+            for event in batch:
+                if event.event_type != EventType.ATC_DECISION:
+                    continue
+                prior = event.payload
+                if not isinstance(prior, ATCDecision) or prior.command_id != request.command_id:
+                    continue
+                if self._fingerprint(prior) != fingerprint:
+                    raise DomainError(
+                        "COMMAND_ID_CONFLICT",
+                        "command_id was already used with a different ATC request",
+                    )
+                raise DomainError(
+                    "COMMAND_OUTCOME_UNCERTAIN",
+                    "ATC command was durably received but its cached result is missing; "
+                    "do not retry this action until the audit has been reconciled",
+                )
+            after_seq = batch[-1].seq
+            if len(batch) < 500:
+                return
+
     def _record(self, request: BaseModel, response: CommandResponse) -> None:
         self.store.record_command(
             CommandRecord(
@@ -127,6 +169,33 @@ class Orchestrator:
         if scenario_run_id != self._snapshot.scenario_run_id:
             raise DomainError("STALE_SCENARIO_RUN", "scenario_run_id does not match the active run")
 
+    def _refresh_guardian_snapshot(self) -> None:
+        """Mirror Guardian's authoritative state; never retain a retired alert."""
+        incident = self.guardian.active_incident
+        self._snapshot.guardian_state = self.guardian.state
+        self._snapshot.active_incident = incident.model_copy(deep=True) if incident else None
+        if incident is None or incident.incident_id != self._sentinel_admitted_incident_id:
+            self._sentinel_admitted_incident_id = None
+
+    def _require_delivered_active_incident(self) -> GuardianIncident:
+        """Only a still-escalated, already-handed-off incident may reach Sentinel."""
+        cached = self._snapshot.active_incident
+        active = self.guardian.active_incident
+        if active is None or self.guardian.state != GuardianState.ESCALATED:
+            self._refresh_guardian_snapshot()
+            raise DomainError("NO_ACTIVE_INCIDENT", "no active Guardian incident can authorize this command")
+        if (
+            cached is None
+            or cached != active
+            or self._sentinel_admitted_incident_id != active.incident_id
+        ):
+            self._refresh_guardian_snapshot()
+            raise DomainError(
+                "INCIDENT_NOT_SYNCHRONIZED",
+                "Guardian incident does not match the active Sentinel handoff",
+            )
+        return active
+
     def _event(
         self,
         event_type: EventType,
@@ -135,11 +204,13 @@ class Orchestrator:
         correlation_id: UUID,
         payload: BaseModel,
         causation_event_id: UUID | None = None,
+        *,
+        occurred_at: datetime | None = None,
     ) -> DomainEvent:
         return DomainEvent(
             event_id=uuid4(),
             event_type=event_type,
-            occurred_at=self.clock.now().astimezone(timezone.utc),
+            occurred_at=(occurred_at if occurred_at is not None else self.clock.now()).astimezone(timezone.utc),
             source=source,
             scenario_run_id=scenario_run_id,
             correlation_id=correlation_id,
@@ -170,6 +241,7 @@ class Orchestrator:
             telemetry = self.simulator.start(run_id, request.scenario_id, now)
             self.guardian.reset(run_id)
             self.sentinel.reset(run_id, definition.atc_connected)
+            self._sentinel_admitted_incident_id = None
             self._snapshot = SystemSnapshot(
                 scenario_id=request.scenario_id,
                 scenario_run_id=run_id,
@@ -220,6 +292,32 @@ class Orchestrator:
                 raise DomainError("NO_SCENARIO_RUNNER", "active scenario runner is unavailable", 500)
             now = self.clock.advance(request.delta_ms)
             due_pilots = self._runner.advance(request.delta_ms)
+            end_elapsed_ms = self._runner.elapsed_ms
+            begin_elapsed_ms = end_elapsed_ms - request.delta_ms
+
+            # ScenarioRunner currently returns pilot IDs without their scheduled
+            # offsets. Resolve offsets from its own immutable scenario definition;
+            # never stamp a due observation with the batch's final clock time.
+            # Keep this adapter inside platform until Rohan adds an owned timed
+            # runner API. No public contract or scenario code is changed here.
+            due_times: dict[PilotId, deque[datetime]] = defaultdict(deque)
+            for scheduled_ms, pilot_id in sorted(
+                self._runner.definition.observation_schedule, key=lambda entry: entry[0]
+            ):
+                if begin_elapsed_ms < scheduled_ms <= end_elapsed_ms:
+                    due_times[pilot_id].append(
+                        now - timedelta(milliseconds=end_elapsed_ms - scheduled_ms)
+                    )
+            scheduled_observations: list[tuple[datetime, PilotId]] = []
+            for pilot_id in due_pilots:
+                # An injected test runner may supply unscheduled observations.
+                # Preserve its old virtual-now behavior without changing the
+                # production runner's existing public return type.
+                timestamps = due_times[pilot_id]
+                observed_at = timestamps.popleft() if timestamps else now
+                scheduled_observations.append((observed_at, pilot_id))
+            scheduled_observations.sort(key=lambda entry: entry[0])
+
             telemetry = self.simulator.advance(request.scenario_run_id, now)
             base_events: list[DomainEvent] = [
                 self._event(
@@ -238,8 +336,8 @@ class Orchestrator:
                 ),
             ]
             observations = []
-            for pilot_id in due_pilots:
-                observation = self.vision.observe(pilot_id, now)
+            for observed_at, pilot_id in scheduled_observations:
+                observation = self.vision.observe(pilot_id, observed_at)
                 observations.append(observation)
                 base_events.append(
                     self._event(
@@ -248,6 +346,7 @@ class Orchestrator:
                         request.scenario_run_id,
                         request.command_id,
                         observation,
+                        occurred_at=observed_at,
                     )
                 )
             committed = self._commit(base_events)
@@ -269,12 +368,14 @@ class Orchestrator:
                         request.command_id,
                         incident,
                         event.event_id,
+                        occurred_at=event.occurred_at,
                     )
                     incident_stored = self._commit([incident_event])
                     derived.extend(incident_stored)
                     self._incidents.append(incident)
                     self._snapshot.active_incident = incident
-                    sentinel_decision = self.sentinel.on_incident(incident, now)
+                    sentinel_decision = self.sentinel.on_incident(incident, event.occurred_at)
+                    self._sentinel_admitted_incident_id = incident.incident_id
                     derived.extend(
                         self._commit(
                             [
@@ -285,11 +386,14 @@ class Orchestrator:
                                     request.command_id,
                                     sentinel_decision,
                                     incident_stored[-1].event_id,
+                                    occurred_at=event.occurred_at,
                                 )
                             ]
                         )
                     )
-            self._snapshot.guardian_state = self.guardian.state
+            # A later credible responsive observation may retire an earlier incident
+            # without emitting a new GuardianIncident. Never leave its snapshot live.
+            self._refresh_guardian_snapshot()
             self._snapshot.sentinel_state = self.sentinel.state
             response = CommandResponse(
                 command_id=request.command_id,
@@ -307,9 +411,8 @@ class Orchestrator:
             fingerprint = self._fingerprint(acknowledgement)
             if existing := self._existing(acknowledgement.command_id, fingerprint):
                 return existing
-            if self._snapshot.active_incident is None:
-                raise DomainError("NO_ACTIVE_INCIDENT", "no active incident can be acknowledged")
-            if acknowledgement.alert_id != self._snapshot.active_incident.incident_id:
+            active_incident = self._require_delivered_active_incident()
+            if acknowledgement.alert_id != active_incident.incident_id:
                 raise DomainError("INCIDENT_MISMATCH", "alert_id does not match the active incident")
             self.guardian.acknowledge(acknowledgement)
             stored = self._commit(
@@ -323,8 +426,7 @@ class Orchestrator:
                     )
                 ]
             )
-            self._snapshot.guardian_state = self.guardian.state
-            self._snapshot.active_incident = self.guardian.active_incident
+            self._refresh_guardian_snapshot()
             response = CommandResponse(
                 command_id=acknowledgement.command_id,
                 accepted=True,
@@ -341,9 +443,13 @@ class Orchestrator:
             fingerprint = self._fingerprint(decision)
             if existing := self._existing(decision.command_id, fingerprint):
                 return existing
-            if self._snapshot.active_incident is None:
-                raise DomainError("NO_ACTIVE_INCIDENT", "no active incident is awaiting a decision")
-            if decision.incident_id != self._snapshot.active_incident.incident_id:
+            # The write-ahead ATC intent is authoritative even when final response
+            # caching fails. Prevent replay across storage/HTTP error boundaries.
+            self._reject_unrecorded_atc_replay(decision, fingerprint)
+            # Guardian, not a possibly stale snapshot or Sentinel's retained state,
+            # is the current incident authority. This gate MUST precede decide().
+            active_incident = self._require_delivered_active_incident()
+            if decision.incident_id != active_incident.incident_id:
                 raise DomainError("INCIDENT_MISMATCH", "incident_id does not match the active incident")
             try:
                 sentinel_decision = self.sentinel.decide(decision)
@@ -366,59 +472,182 @@ class Orchestrator:
                 ),
             ]
             message = "Simulated ATC rejection recorded; no action executed"
+            accepted = True
+            intent_stored: list[StoredEvent] = []
             if decision.decision == ATCDecisionType.APPROVE:
+                # Simulator execution is a separate trust boundary. A positive ATC
+                # decision is NOT proof that the simulator executed successfully.
+                if (
+                    sentinel_decision.scenario_run_id != decision.scenario_run_id
+                    or sentinel_decision.incident_id != decision.incident_id
+                    or sentinel_decision.action_type != decision.requested_action
+                    or sentinel_decision.authorization_source != AuthorizationSource.SIMULATED_ATC
+                    or sentinel_decision.result != DecisionResult.APPROVED
+                    or sentinel_decision.sentinel_state != SentinelState.SIM_ACTION_RUNNING
+                ):
+                    raise DomainError(
+                        "AUTHORIZATION_REJECTED",
+                        "Sentinel did not issue a matching, approved simulated-action authorization",
+                    )
+
+                # Durable authorization intent MUST precede the external simulator
+                # side effect. If storage or event publication fails here, do not
+                # invoke the simulator; the retained Sentinel state fails closed.
                 try:
-                    action = self.simulator.apply_action(
+                    intent_stored = self._commit(domain_events)
+                    if len(intent_stored) != len(domain_events):
+                        raise RuntimeError("ATC intent append did not acknowledge all events")
+                except Exception as exc:
+                    logger.exception("ATC intent persistence failed; simulator was not invoked")
+                    raise DomainError(
+                        "ATC_INTENT_UNAVAILABLE",
+                        "Could not record ATC authorization intent; no simulator action was attempted",
+                        503,
+                    ) from exc
+                domain_events = []
+
+                action: SimulatorActionPayload | None = None
+                failure_reason: str | None = None
+                executed = False
+                try:
+                    candidate = self.simulator.apply_action(
                         decision.scenario_run_id,
                         decision.requested_action,
                         sentinel_decision,
                         self.clock.now(),
                     )
-                except ValueError as exc:
-                    raise DomainError("SIMULATOR_REJECTED", str(exc)) from exc
-                domain_events.append(
-                    self._event(
-                        EventType.SIMULATOR_ACTION,
-                        EventSource.SIMULATOR,
-                        decision.scenario_run_id,
-                        decision.command_id,
-                        action,
+                except Exception:
+                    logger.exception("Simulator raised during a symbolic action attempt")
+                    failure_reason = "Simulator raised an error; execution outcome is unconfirmed"
+                else:
+                    # Revalidate mutable Pydantic models rather than trusting an
+                    # adapter's `model_copy(update=...)` or accidental wrong-run reply.
+                    try:
+                        if not isinstance(candidate, SimulatorActionPayload):
+                            raise ValueError("simulator returned a non-canonical action payload")
+                        candidate = SimulatorActionPayload.model_validate(candidate.model_dump())
+                    except Exception:
+                        failure_reason = "Simulator returned an invalid action payload; execution unconfirmed"
+                    else:
+                        if (
+                            candidate.scenario_run_id != decision.scenario_run_id
+                            or candidate.action_type != decision.requested_action
+                            or candidate.authorization_source != AuthorizationSource.SIMULATED_ATC
+                        ):
+                            failure_reason = "Simulator action context mismatch; execution unconfirmed"
+                        elif not candidate.authorized or candidate.result != DecisionResult.EXECUTED:
+                            failure_reason = "Simulator did not confirm authorized execution"
+                        else:
+                            action = candidate
+
+                if action is not None:
+                    # Record the actual successful action even if the subsequent
+                    # parameterless Sentinel completion callback should fail.
+                    domain_events.append(
+                        self._event(
+                            EventType.SIMULATOR_ACTION,
+                            EventSource.SIMULATOR,
+                            decision.scenario_run_id,
+                            decision.command_id,
+                            action,
+                        )
                     )
-                )
-                self.sentinel.complete_action()
-                completion = SentinelDecision(
-                    decision_id=uuid4(),
-                    scenario_run_id=decision.scenario_run_id,
-                    incident_id=decision.incident_id,
-                    sentinel_state=SentinelState.COMPLETED,
-                    action_type=decision.requested_action,
-                    authorization_source=AuthorizationSource.SIMULATED_ATC,
-                    reason="Simulator independently validated and executed one symbolic action.",
-                    evidence_event_ids=self._snapshot.active_incident.evidence_event_ids,
-                    executed_at=self.clock.now(),
-                    result=DecisionResult.EXECUTED,
-                )
-                domain_events.append(
-                    self._event(
-                        EventType.SENTINEL_DECISION,
-                        EventSource.SENTINEL,
-                        decision.scenario_run_id,
-                        decision.command_id,
-                        completion,
+                    executed = True
+                    self._snapshot.last_simulator_action = action
+                    try:
+                        self.sentinel.complete_action()
+                    except Exception:
+                        logger.exception("Sentinel completion failed after verified simulator action")
+                        failure_reason = "Simulator action executed, but Sentinel completion failed"
+                    else:
+                        completion = SentinelDecision(
+                            decision_id=uuid4(),
+                            scenario_run_id=decision.scenario_run_id,
+                            incident_id=decision.incident_id,
+                            sentinel_state=SentinelState.COMPLETED,
+                            action_type=decision.requested_action,
+                            authorization_source=AuthorizationSource.SIMULATED_ATC,
+                            reason="Simulator independently validated and executed one symbolic action.",
+                            evidence_event_ids=active_incident.evidence_event_ids,
+                            executed_at=self.clock.now(),
+                            result=DecisionResult.EXECUTED,
+                        )
+                        domain_events.append(
+                            self._event(
+                                EventType.SENTINEL_DECISION,
+                                EventSource.SENTINEL,
+                                decision.scenario_run_id,
+                                decision.command_id,
+                                completion,
+                            )
+                        )
+                        message = f"Executed one authorized symbolic action: {decision.requested_action.value}"
+
+                if failure_reason is not None:
+                    # The v1 Sentinel Protocol has no abort/failure transition.
+                    # Remain fail-closed in SIM_ACTION_RUNNING; never invent a
+                    # COMPLETED / EXECUTED decision for a failed or unknown result.
+                    failure = SentinelDecision(
+                        decision_id=uuid4(),
+                        scenario_run_id=decision.scenario_run_id,
+                        incident_id=decision.incident_id,
+                        sentinel_state=self.sentinel.state,
+                        action_type=decision.requested_action,
+                        authorization_source=AuthorizationSource.SIMULATED_ATC,
+                        reason=(
+                            f"{failure_reason}; reconcile or reset the scenario before a new attempt."
+                        ),
+                        evidence_event_ids=active_incident.evidence_event_ids,
+                        executed_at=self.clock.now(),
+                        result=DecisionResult.FAILED,
                     )
-                )
-                self._snapshot.last_simulator_action = action
-                message = f"Executed one authorized symbolic action: {decision.requested_action.value}"
-            stored = self._commit(domain_events)
+                    domain_events.append(
+                        self._event(
+                            EventType.SENTINEL_DECISION,
+                            EventSource.SENTINEL,
+                            decision.scenario_run_id,
+                            decision.command_id,
+                            failure,
+                        )
+                    )
+                    accepted = False
+                    message = (
+                        f"{failure_reason}; verified action recorded, but completion requires reconciliation"
+                        if executed
+                        else f"{failure_reason}; no successful execution recorded; reset/reconcile before retry"
+                    )
+            # A simulator action can have executed even if the final append
+            # fails. Never retry an already-journaled ATC intent automatically.
+            try:
+                result_stored = self._commit(domain_events)
+            except Exception as exc:
+                self._snapshot.sentinel_state = self.sentinel.state
+                logger.exception("ATC result persistence failed; outcome may have side effects")
+                raise DomainError(
+                    "ATC_OUTCOME_UNCERTAIN",
+                    "Action outcome could not be durably recorded; do not retry or "
+                    "treat it as completed until the audit is reconciled",
+                    503,
+                ) from exc
+            stored = intent_stored + result_stored
             self._snapshot.sentinel_state = self.sentinel.state
             response = CommandResponse(
                 command_id=decision.command_id,
-                accepted=True,
+                accepted=accepted,
                 message=message,
                 snapshot=self.snapshot,
                 events=stored,
             )
-            self._record(decision, response)
+            try:
+                self._record(decision, response)
+            except Exception as exc:
+                logger.exception("ATC command-result caching failed after event persistence")
+                raise DomainError(
+                    "ATC_RESULT_CACHE_UNAVAILABLE",
+                    "ATC events were journaled but the command result is not cached; "
+                    "inspect the audit before attempting another command",
+                    503,
+                ) from exc
             return response
 
     def set_link(self, request: CommunicationLinkRequest) -> CommandResponse:
@@ -427,6 +656,24 @@ class Orchestrator:
             fingerprint = self._fingerprint(request)
             if existing := self._existing(request.command_id, fingerprint):
                 return existing
+
+            # Reconnect is only a delivery opportunity, never an authorization.
+            # Preserve proof that the incident was already admitted to Sentinel
+            # before refreshing the (possibly stale) platform snapshot.
+            was_connected = self._snapshot.communication.atc_link_connected
+            guardian_incident = self.guardian.active_incident
+            replay_incident = (
+                guardian_incident
+                if request.atc_link_connected
+                and not was_connected
+                and self.sentinel.state == SentinelState.STANDBY
+                and self.guardian.state == GuardianState.ESCALATED
+                and guardian_incident is not None
+                and self._snapshot.active_incident == guardian_incident
+                and self._sentinel_admitted_incident_id == guardian_incident.incident_id
+                else None
+            )
+
             self.sentinel.set_atc_link(request.scenario_run_id, request.atc_link_connected)
             payload = ATCLinkChangedPayload(
                 command_id=request.command_id,
@@ -447,11 +694,41 @@ class Orchestrator:
             self._snapshot.communication = self._snapshot.communication.model_copy(
                 update={"atc_link_connected": request.atc_link_connected, "last_change_at": request.changed_at}
             )
+            # A retired incident must stay retired even if Sentinel still holds
+            # its old local incident. No stale/unsynchronized episode is replayed.
+            self._refresh_guardian_snapshot()
+            redelivery_rejected = False
+            if replay_incident is not None:
+                # Re-deliver the *same* authorized handoff as a new pending
+                # decision. The frozen Sentinel Protocol intentionally has no
+                # direct reconnect-resume method; on_incident is its safe gate.
+                try:
+                    pending = self.sentinel.on_incident(replay_incident, self.clock.now())
+                except ValueError:
+                    # The link change is already durable. Record its command
+                    # result rather than failing the request after a side effect.
+                    # The invariant remains fail-closed: no handoff, no approval.
+                    redelivery_rejected = True
+                else:
+                    stored.extend(self._commit([
+                        self._event(
+                            EventType.SENTINEL_DECISION,
+                            EventSource.SENTINEL,
+                            request.scenario_run_id,
+                            request.command_id,
+                            pending,
+                            stored[0].event_id,
+                        )
+                    ]))
             self._snapshot.sentinel_state = self.sentinel.state
             response = CommandResponse(
                 command_id=request.command_id,
                 accepted=True,
-                message="Simulated ATC link updated; link state alone authorizes no action",
+                message=(
+                    "Simulated ATC link updated; incident redelivery rejected; no action authorized"
+                    if redelivery_rejected
+                    else "Simulated ATC link updated; link state alone authorizes no action"
+                ),
                 snapshot=self.snapshot,
                 events=stored,
             )
@@ -475,6 +752,7 @@ class Orchestrator:
             telemetry = self.simulator.reset(new_run_id, scenario_id, now)
             self.guardian.reset(new_run_id)
             self.sentinel.reset(new_run_id, definition.atc_connected)
+            self._sentinel_admitted_incident_id = None
             self._snapshot = SystemSnapshot(
                 scenario_id=scenario_id,
                 scenario_run_id=new_run_id,

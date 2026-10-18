@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -18,8 +19,33 @@ from app.modules.simulator import MockAircraftSimulator
 from app.modules.vision import MockVisionAdapter
 
 
-def create_app(database_path: str | Path | None = None) -> FastAPI:
+def create_app(
+    database_path: str | Path | None = None,
+    *,
+    agent_mode: Literal["mock", "deterministic"] | None = None,
+) -> FastAPI:
+    """Create one simulation API with explicit, opt-in deterministic agents.
+
+    Defaults to the frozen v1 mock demo. In deterministic mode, the real
+    Guardian and Sentinel are both injected through their public Protocols.
+    All orchestration and simulator authorization remain in the same root.
+    """
     settings = Settings.from_environment()
+    mode = settings.agent_mode if agent_mode is None else agent_mode
+    if mode not in ("mock", "deterministic"):
+        raise ValueError("agent_mode must be 'mock' or 'deterministic'")
+    if mode == "deterministic":
+        # Lazy imports avoid eagerly initializing optional modules in mock mode.
+        # These are the owned public exports, not feature-private internals.
+        from app.modules.guardian import DeterministicGuardianAgent
+        from app.modules.sentinel import DeterministicSentinelAgent
+
+        guardian = DeterministicGuardianAgent()
+        sentinel = DeterministicSentinelAgent()
+    else:
+        guardian = MockGuardianAgent()
+        sentinel = MockSentinelAgent()
+
     store = SQLiteEventStore(database_path or settings.database_path)
     orchestrator = Orchestrator(
         store=store,
@@ -27,8 +53,8 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         clock=VirtualClock(),
         vision=MockVisionAdapter(),
         simulator=MockAircraftSimulator(),
-        guardian=MockGuardianAgent(),
-        sentinel=MockSentinelAgent(),
+        guardian=guardian,
+        sentinel=sentinel,
     )
 
     @asynccontextmanager
@@ -43,6 +69,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.orchestrator = orchestrator
+    app.state.agent_mode = mode
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
