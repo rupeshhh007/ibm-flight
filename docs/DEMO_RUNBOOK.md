@@ -4,24 +4,25 @@
 
 ## Status
 
-The P0 backend, Makefile, five deterministic scenario IDs, REST workflow, tests, and smoke path are implemented. The polished frontend is P1, so use the REST API or `make smoke` until Tarun's UI lands. Expected P0 outcomes below are covered by API tests where marked; richer scenario presentation remains P1.
+The six-member local application, including React dashboard and integrated backend, is merged into `main` as of October 18, 2026. The final pre-merge combination passed 690 backend tests (10 skipped), 69 frontend tests, and an 18-event safety smoke test. Re-run on final `main` before reporting final-main results. IBM LinuxONE deployment and replay-safe SSE remain unverified/not shipped.
 
 ## Environment preparation
 
-Prerequisites are Python 3.11+, Node.js/npm, GNU Make, Git, and SQLite support. The verified P0 flow is:
+Prerequisites are Python 3.11+, Node.js/npm, GNU Make, Git, and SQLite support. For a fresh checkout, use:
 
 ```text
 make setup
 make check
 make smoke
-make backend
+npm --prefix frontend test
+npm --prefix frontend run build
 ```
 
-`make backend` starts FastAPI at `127.0.0.1:8000`. `make dev` and the Vite UI are P1 and are not advertised as working. The default demo requires no webcam, LinuxONE, or credentials. Confirm `/healthz`, `/readyz`, `/api/v1/state`, and `/api/v1/scenarios` before presenting.
+Start `AEROGUARD_AGENT_MODE=deterministic make backend` in the first terminal (or `make backend` for default mocks). Start `npm --prefix frontend run dev` in a second terminal, then open `http://127.0.0.1:5173/`. The backend listens on `127.0.0.1:8000`. The default mock path requires no webcam, LinuxONE, or credentials. Confirm `/healthz`, `/readyz`, `/api/v1/state`, and `/api/v1/scenarios`. If Vite reports `ECONNREFUSED 127.0.0.1:8000`, the backend is not running.
 
 ## Common scenario procedure
 
-1. Use the generated OpenAPI at `/docs` or an API client to select the stable scenario ID; the visual Emergency Simulation screen is P1.
+1. Select the stable scenario ID in the **Scenarios** view, or use generated OpenAPI at `/docs`.
 2. Start the scenario through `POST /api/v1/scenarios/start`. Record the returned `scenario_run_id`; the first committed events have increasing `seq` values.
 3. Query `GET /api/v1/state` and confirm both pilot entries, synthetic telemetry, Guardian/Sentinel states, and the simulation-only status.
 4. Advance virtual time in bounded steps. Boundary events are expected to be inclusive; do not wait real minutes.
@@ -110,6 +111,10 @@ After every scenario, capture the last sequence and old run ID, reset, and verif
 - old events remain available through history;
 - sequence numbers continue increasing globally;
 - an old-run acknowledgement or ATC decision is rejected and causes no action.
+
+## Capture evidence
+
+Record the current `git rev-parse HEAD` and completed command outputs. Capture screenshots of **Flight Deck**, **Scenarios**, **Sentinel** (before and after fictional approval), and **Black Box** (ordered event history). Make a short video showing connected-dual-pilot escalation, rejection with no simulator action, subsequent valid approval with one `SIM_STABILIZE`, and deduplication. Verify `normal_flight` and `camera_obstructed` remain safe. Do not show LinuxONE as deployed without a real target/ingestion record.
 
 ## Suggested judge sequence
 
