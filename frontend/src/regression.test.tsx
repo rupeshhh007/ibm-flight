@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError } from "./api/client";
+import { ApiError, api } from "./api/client";
 import type { Api } from "./api/client";
 import type { CommandResponse, EventHistoryResponse, SystemSnapshot } from "./api/types";
 import { App } from "./App";
@@ -11,6 +11,7 @@ afterEach(() => {
   cleanup();
   window.location.hash = "";
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 let refreshBridge: (() => Promise<void>) | null = null;
@@ -556,60 +557,78 @@ describe("ISSUE 4 REGRESSION: Bounded request timeout & command lock recovery", 
     expect(await screen.findByText(/Reset successful/)).toBeTruthy();
   });
 
-  it("prevents late response from timed-out command from overwriting newer state or lock", async () => {
-    const delayedAdvance = deferred<CommandResponse>();
-    let count = 0;
+  it("discards the late response of a timed-out command instead of overwriting newer state or the lock", async () => {
+    // Exercises the real transport: advanceScenario goes through api.advanceScenario
+    // (request() with its AbortController timeout) against a stubbed fetch that behaves
+    // like a browser — it rejects when aborted, and the server's answer can still arrive later.
+    const sentCommandIds: string[] = [];
+    let firstSignal: AbortSignal | null = null;
+    const lateFirstResponse = deferred<Response>();
+    const commandResponse = (body: CommandResponse) => new Response(JSON.stringify(body), { status: 200 });
 
-    const advanceScenario = vi.fn().mockImplementation(() => {
-      count += 1;
-      if (count === 1) {
-        // First command times out on client side
-        return Promise.reject(new ApiError("TIMEOUT_ERROR", "Timed out", 0));
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => {
+      sentCommandIds.push((JSON.parse(String(init.body)) as { command_id: string }).command_id);
+      if (sentCommandIds.length === 1) {
+        firstSignal = init.signal ?? null;
+        return new Promise<Response>((resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")));
+          void lateFirstResponse.promise.then(resolve);
+        });
       }
-      return Promise.resolve<CommandResponse>({
-        command_id: "second-command",
-        accepted: true,
-        duplicate: false,
-        message: "Second command executed",
-        snapshot: makeSnapshot({ latest_event_seq: 99, status_text: "New State" }),
-        events: [makeEvent(99)],
-      });
+      return Promise.resolve(
+        commandResponse({
+          command_id: sentCommandIds[1],
+          accepted: true,
+          duplicate: false,
+          message: "Second command executed",
+          snapshot: makeSnapshot({ latest_event_seq: 99 }),
+          events: [makeEvent(99)],
+        }),
+      );
     });
+    vi.stubGlobal("fetch", fetchMock);
 
+    const advanceScenario: Api["advanceScenario"] = (body) => api.advanceScenario(body, { timeoutMs: 50 });
     const client = makeClient(makeSnapshot(), { advanceScenario });
     renderApp(client, "#simulation");
 
-    const advanceBtn = await screen.findByRole("button", { name: /Advance \+1000 ms/ });
+    const advanceBtn = (await screen.findByRole("button", { name: /Advance \+1000 ms/ })) as HTMLButtonElement;
 
-    // Trigger command 1 (times out)
-    await act(async () => {
-      fireEvent.click(advanceBtn);
-    });
-
+    // Command 1 never answers in time: request() aborts it and reports an uncertain outcome.
+    fireEvent.click(advanceBtn);
     expect(await screen.findByText(/command outcome (unknown|uncertain)/i)).toBeTruthy();
+    expect(firstSignal).not.toBeNull();
+    expect(firstSignal!.aborted).toBe(true);
 
-    // Trigger command 2 (executes successfully)
-    await act(async () => {
-      fireEvent.click(advanceBtn);
-    });
-
+    // The pending-command lock was released, so command 2 can run and its state applies.
+    await waitFor(() => expect(advanceBtn.disabled).toBe(false));
+    fireEvent.click(advanceBtn);
     expect(await screen.findByText(/Second command executed/)).toBeTruthy();
-    expect(screen.getByText(/#99/)).toBeTruthy();
+    expect(screen.getByText("#99")).toBeTruthy();
+    expect(sentCommandIds).toHaveLength(2);
+    expect(sentCommandIds[1]).not.toBe(sentCommandIds[0]);
 
-    // Late resolution of command 1 arrives now
+    // The backend's answer to command 1 now arrives, carrying an older snapshot and event.
     await act(async () => {
-      delayedAdvance.resolve({
-        command_id: "first-command-late",
-        accepted: true,
-        duplicate: false,
-        message: "Late first command",
-        snapshot: makeSnapshot({ latest_event_seq: 50, status_text: "Late Old State" }),
-        events: [makeEvent(50)],
-      });
+      lateFirstResponse.resolve(
+        commandResponse({
+          command_id: sentCommandIds[0],
+          accepted: true,
+          duplicate: false,
+          message: "Late first command",
+          snapshot: makeSnapshot({ latest_event_seq: 50 }),
+          events: [makeEvent(50)],
+        }),
+      );
+      await lateFirstResponse.promise;
     });
 
-    // Newer state from command 2 remains active and unaffected
+    // Nothing from the late response is applied: outcome, state, history and lock are unchanged.
     expect(screen.getByText(/Second command executed/)).toBeTruthy();
-    expect(screen.getByText(/#99/)).toBeTruthy();
+    expect(screen.queryByText(/Late first command/)).toBeNull();
+    expect(screen.getByText("#99")).toBeTruthy();
+    expect(screen.queryByText("#50")).toBeNull();
+    expect(advanceBtn.disabled).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
