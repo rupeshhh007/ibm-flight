@@ -6,6 +6,8 @@ type Schemas = components["schemas"];
 export type GuardianState = Schemas["GuardianState"];
 export type SentinelState = Schemas["SentinelState"];
 export type PilotObservationStatus = Schemas["PilotObservationStatus"];
+export type DecisionResult = Schemas["DecisionResult"];
+export type EventType = Schemas["EventType"];
 
 export type Tone = "ok" | "info" | "warn" | "alert" | "muted";
 
@@ -32,13 +34,33 @@ export const OBSERVATION_TONE: Record<PilotObservationStatus, Tone> = {
   UNKNOWN: "muted",
 };
 
-/** Guardian states in escalation order, used for the state ladder. */
-export const GUARDIAN_LADDER: GuardianState[] = ["NORMAL", "SUSPECTED", "AWAITING_ACK", "ESCALATED", "RECOVERING"];
-export const SENTINEL_LADDER: SentinelState[] = [
-  "STANDBY",
-  "AWAITING_ATC",
-  "LOCAL_FALLBACK",
-  "SIM_ACTION_RUNNING",
-  "COMPLETED",
-  "ABORTED",
-];
+export const RESULT_TONE: Record<DecisionResult, Tone> = {
+  PENDING: "warn",
+  APPROVED: "info",
+  REJECTED: "muted",
+  EXECUTED: "ok",
+  FAILED: "alert",
+};
+
+export const EVENT_TONE: Record<EventType, Tone> = {
+  SCENARIO_STARTED: "info",
+  SCENARIO_ADVANCED: "muted",
+  PILOT_OBSERVATION: "muted",
+  TELEMETRY_UPDATED: "muted",
+  PILOT_ACKNOWLEDGED: "ok",
+  ATC_LINK_CHANGED: "info",
+  GUARDIAN_INCIDENT: "alert",
+  ATC_DECISION: "warn",
+  SENTINEL_DECISION: "warn",
+  SIMULATOR_ACTION: "ok",
+  SCENARIO_RESET: "info",
+  SCENARIO_COMPLETED: "info",
+};
+
+/** Guardian escalation scale (ordered); RECOVERING is an off-track state. */
+export const GUARDIAN_TRACK: GuardianState[] = ["NORMAL", "SUSPECTED", "AWAITING_ACK", "ESCALATED"];
+export const GUARDIAN_ALTERNATES: GuardianState[] = ["RECOVERING"];
+
+/** Sentinel's main authorization path; fallback/abort are off-track states. */
+export const SENTINEL_TRACK: SentinelState[] = ["STANDBY", "AWAITING_ATC", "SIM_ACTION_RUNNING", "COMPLETED"];
+export const SENTINEL_ALTERNATES: SentinelState[] = ["LOCAL_FALLBACK", "ABORTED"];

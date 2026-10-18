@@ -278,10 +278,16 @@ export function AeroGuardProvider({ children, client = defaultApi, pollMs = POLL
             : new ApiError("UNCERTAIN_TRANSPORT_ERROR", String(error), 0);
 
         const isUncertain = apiError.isUncertain;
+        // An unstructured 5xx means the backend failed mid-command: it may have partly
+        // applied, so point the user at the audit history rather than implying "no effect".
+        const message =
+          apiError.status >= 500
+            ? `${apiError.message} The command may have partly applied; state is re-syncing, check the audit history before retrying.`
+            : apiError.message;
         setOutcome({
           label,
           status: isUncertain ? (apiError.isTimeout ? "uncertain" : "network") : "rejected",
-          message: apiError.message,
+          message,
           code: apiError.code,
           details: apiError.details,
           at: Date.now(),

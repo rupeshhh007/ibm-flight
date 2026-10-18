@@ -76,6 +76,10 @@ export function parseErrorBody(status: number, body: unknown): ApiError {
   if (isRecord(body) && typeof body.detail === "string") {
     return new ApiError(`HTTP_${status}`, body.detail, status);
   }
+  if (status >= 500) {
+    // Neutral on purpose: this helper serves polls too, so it cannot claim a command was involved.
+    return new ApiError(`HTTP_${status}`, `Backend internal error (HTTP ${status}).`, status);
+  }
   return new ApiError(`HTTP_${status}`, `Request failed with HTTP ${status}`, status);
 }
 

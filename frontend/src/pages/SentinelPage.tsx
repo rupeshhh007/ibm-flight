@@ -1,17 +1,68 @@
 import { useMemo, useState } from "react";
-import { SIMULATOR_ACTIONS, type SimulatorActionType } from "../api/types";
-import { shortId } from "../components/format";
-import { Empty, Pill } from "../components/ui";
-import { eventsForRun, sentinelDecisions } from "../hooks/selectors";
+import { SIMULATOR_ACTIONS, type SentinelDecision, type SimulatorActionType, type SystemSnapshot } from "../api/types";
+import { Card, Chip, LinkScene, SectionHeader } from "../components/console";
+import { formatClock, humanize, shortId } from "../components/format";
+import { Icon, type IconName } from "../components/icons";
+import { CommsLog } from "../components/Insights";
+import { EvidenceTable, IncidentSummary, LastActionCard, SentinelDecisionList } from "../components/StatePanels";
+import { SENTINEL_ALTERNATES, SENTINEL_TONE, SENTINEL_TRACK, type Tone } from "../components/tones";
+import { Empty, Notice, StateTrack } from "../components/ui";
+import { commsLog, eventsForRun, latestDecisionFor, resolveEvidence, sentinelDecisions } from "../hooks/selectors";
 import { useAeroGuard } from "../hooks/useAeroGuard";
-import { decisionBlocker } from "./ATCPage";
 
+// APPROVE must request a real symbolic action, so NO_OP is not offered for approval.
 const APPROVABLE_ACTIONS = SIMULATOR_ACTIONS.filter((a): a is Exclude<SimulatorActionType, "NO_OP"> => a !== "NO_OP");
+
+/**
+ * Why the decision buttons are disabled, or null if a decision can be sent.
+ * This is a UX hint only — the backend re-validates everything and is authoritative.
+ */
+export function decisionBlocker(snapshot: SystemSnapshot | null, pending: string | null): string | null {
+  if (!snapshot?.scenario_run_id) return "No active scenario run.";
+  if (!snapshot.communication.atc_link_connected) return "Simulated ATC link is disconnected.";
+  if (!snapshot.active_incident) return "No active incident is awaiting a decision.";
+  if (snapshot.sentinel_state === "STANDBY")
+    return "Sentinel is in Standby, not awaiting simulated ATC. In this build, reconnecting the link does not re-request authorization; reset the run to repeat the flow.";
+  if (snapshot.sentinel_state !== "AWAITING_ATC")
+    return `Sentinel is not awaiting simulated ATC (state: ${humanize(snapshot.sentinel_state)}).`;
+  if (pending) return "Another command is in flight.";
+  return null;
+}
+
+/** Headline authorization status, derived from the newest Sentinel decision for the active incident. */
+export function authorizationStatus(
+  snapshot: SystemSnapshot,
+  latest: { decision: SentinelDecision } | null,
+): { tone: Tone; icon: IconName; title: string; detail: string } {
+  if (!snapshot.active_incident) return { tone: "muted", icon: "info", title: "No request", detail: "No active incident requires authorization." };
+  const awaiting = snapshot.sentinel_state === "AWAITING_ATC";
+  switch (latest?.decision.result) {
+    case "EXECUTED":
+      return latest.decision.authorization_source === "SIMULATED_ATC"
+        ? { tone: "ok", icon: "check", title: "Approved · executed", detail: `Simulator executed ${latest.decision.action_type}.` }
+        : { tone: "ok", icon: "check", title: "Executed", detail: `Simulator executed ${latest.decision.action_type} (authorization: ${humanize(latest.decision.authorization_source)}).` };
+    case "PENDING":
+      return awaiting
+        ? { tone: "warn", icon: "clock", title: "Awaiting decision", detail: "Sentinel is waiting for an explicit simulated ATC decision." }
+        : { tone: "warn", icon: "clock", title: "Pending", detail: `${latest.decision.reason} Sentinel state: ${humanize(snapshot.sentinel_state)}.` };
+    case "APPROVED":
+      return { tone: "info", icon: "check", title: "Approved", detail: `Action ${latest.decision.action_type} authorized; awaiting simulator result.` };
+    case "REJECTED":
+      return { tone: "muted", icon: "x", title: "Rejected", detail: awaiting ? "No action executed. Sentinel is still awaiting a valid decision." : "No action executed." };
+    case "FAILED":
+      return { tone: "alert", icon: "alert", title: "Failed", detail: latest.decision.reason };
+    default:
+      // No Sentinel decision has been recorded for this incident yet.
+      return awaiting
+        ? { tone: "warn", icon: "clock", title: "Awaiting decision", detail: "Sentinel is waiting for an explicit simulated ATC decision." }
+        : { tone: "muted", icon: "info", title: "Not requested", detail: `Sentinel state: ${humanize(snapshot.sentinel_state)}.` };
+  }
+}
 
 export function SentinelPage() {
   const { snapshot, events, pending, commands } = useAeroGuard();
   const [action, setAction] = useState<SimulatorActionType>("SIM_STABILIZE");
-  const [operatorId] = useState("fictional-atc-demo");
+  const [operatorId, setOperatorId] = useState("fictional-atc-demo");
 
   const runEvents = useMemo(() => eventsForRun(events, snapshot?.scenario_run_id), [events, snapshot?.scenario_run_id]);
   const incident = snapshot?.active_incident ?? null;
@@ -19,213 +70,149 @@ export function SentinelPage() {
     () => sentinelDecisions(runEvents).filter((d) => !incident || d.decision.incident_id === incident.incident_id),
     [runEvents, incident],
   );
+  const evidence = useMemo(() => (incident ? resolveEvidence(runEvents, incident.evidence_event_ids) : []), [runEvents, incident]);
+  const log = useMemo(() => commsLog(runEvents), [runEvents]);
+  const latest = useMemo(() => latestDecisionFor(runEvents, incident?.incident_id), [runEvents, incident?.incident_id]);
 
-  if (!snapshot) return <Empty>Loading Sentinel & ATC telemetry…</Empty>;
+  if (!snapshot) return <Empty>Loading Sentinel and simulated ATC state…</Empty>;
 
   const blocker = decisionBlocker(snapshot, pending);
+  const operatorValid = operatorId.trim().length > 0;
   const link = snapshot.communication;
-  const isApproved = decisions.some((d) => d.decision.result === "APPROVED" || d.decision.result === "EXECUTED" || d.decision.authorization_source === "SIMULATED_ATC") || snapshot.sentinel_state === "COMPLETED";
+  const status = authorizationStatus(snapshot, latest);
+  const executed = snapshot.last_simulator_action;
 
   return (
-    <div className="sentinel-page-layout">
-      {/* Header bar */}
-      <div className="sentinel-header-strip">
-        <div className="sentinel-title-group">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#38bdf8" strokeWidth="2">
-            <circle cx="12" cy="12" r="2" />
-            <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49" />
-          </svg>
-          <h2 className="sentinel-header-title">ATC COMMUNICATION</h2>
-        </div>
-
-        <div className="sentinel-header-link">
-          <Pill tone={link.atc_link_connected ? "ok" : "alert"}>
-            {link.atc_link_connected ? "CONNECTED · ATC Link Active" : "DISCONNECTED · Link Offline"}
-          </Pill>
-        </div>
-      </div>
-
-      <div className="sentinel-main-grid">
-        {/* Left Column: Radio Message Dialogue & Audio Visualizer */}
-        <div className="cyber-card sentinel-chat-card">
-          <div className="cyber-card-header">
-            <span className="cyber-card-title">RADIO TRANSMISSION LOG</span>
-            <span className="mono text-dim text-small">VHF 124.85 MHz</span>
+    <div className="view">
+      <SectionHeader
+        title="Sentinel"
+        subtitle="ATC communication & authorization · fictional simulated console"
+        tone={SENTINEL_TONE[snapshot.sentinel_state]}
+        actions={
+          <div className={`linkbox ${link.atc_link_connected ? "linkbox--ok" : "linkbox--alert"}`}>
+            <span className="linkbox__label">Communication link</span>
+            <strong>{link.atc_link_connected ? "Connected" : "Disconnected"}</strong>
+            <Icon name={link.atc_link_connected ? "signal" : "unlink"} size={18} />
           </div>
+        }
+      />
 
-          <div className="chat-messages-container">
-            <div className="chat-bubble chat-bubble--atc">
-              <div className="chat-bubble-header">
-                <span className="chat-sender mono">ATC</span>
-                <span className="chat-time mono">12:09:15</span>
-              </div>
-              <div className="chat-bubble-text">
-                SIM-001, confirm your status. Radar shows no steering inputs.
-              </div>
-            </div>
+      <Notice tone="info" title="Simulated authorization console.">
+        Not a real ATC system and not an authentication mechanism. Approve and Reject only submit a command to the AeroGuard backend, where Sentinel and the simulator validate it independently.
+      </Notice>
 
-            <div className="chat-bubble chat-bubble--aeroguard">
-              <div className="chat-bubble-header">
-                <span className="chat-sender mono">AEROGUARD</span>
-                <span className="chat-time mono">12:09:17</span>
-              </div>
-              <div className="chat-bubble-text">
-                No response from both pilots. Requesting emergency authorization.
-              </div>
-            </div>
-
-            <div className={`chat-bubble chat-bubble--atc ${isApproved ? "chat-bubble--approved" : ""}`}>
-              <div className="chat-bubble-header">
-                <span className="chat-sender mono">ATC</span>
-                <span className="chat-time mono">12:09:22</span>
-              </div>
-              <div className="chat-bubble-text">
-                {isApproved
-                  ? "Emergency authorization approved. You are cleared to execute stabilization."
-                  : blocker
-                  ? "Stand by, evaluating situational telemetry and priority airspace."
-                  : "SIM-001, authorization pending operator confirmation."}
-              </div>
-            </div>
-
-            {isApproved && (
-              <div className="chat-bubble chat-bubble--aeroguard chat-bubble--success">
-                <div className="chat-bubble-header">
-                  <span className="chat-sender mono">AEROGUARD</span>
-                  <span className="chat-time mono">12:09:23</span>
-                </div>
-                <div className="chat-bubble-text">
-                  Authorization received. Executing stabilization sequence.
-                </div>
-              </div>
+      <div className="g75">
+        <div className="stack">
+          <Card flush className="card--scene">
+            <LinkScene connected={link.atc_link_connected} emergency={Boolean(incident)} aircraftId={snapshot.telemetry?.aircraft_id ?? "SIM"} />
+          </Card>
+          <Card title={`ATC communication (${log.length})`} icon="tower">
+            <CommsLog entries={log} />
+          </Card>
+          <Card title="Active incident & evidence" icon="alert" tone={incident ? (incident.severity === "CRITICAL" ? "alert" : "warn") : undefined}>
+            {incident ? (
+              <IncidentSummary incident={incident}>
+                <h4 className="subhead">Supporting evidence</h4>
+                <EvidenceTable evidence={evidence} />
+              </IncidentSummary>
+            ) : (
+              <Empty icon="shield">No active incident. Decisions can only reference the active run's incident.</Empty>
             )}
-          </div>
-
-          {/* Audio Spectrum Waveform Visualizer */}
-          <div className="radio-visualizer-container">
-            <div className="soundwave-bars" aria-hidden="true">
-              {Array.from({ length: 48 }, (_, i) => {
-                const height = Math.max(15, Math.sin(i * 0.4) * 50 + 40);
-                return (
-                  <span
-                    key={i}
-                    className="wave-bar"
-                    style={{ height: `${height}%`, animationDelay: `${(i % 8) * 0.1}s` }}
-                  />
-                );
-              })}
-            </div>
-            <div className="radio-freq-indicator mono">
-              <span>ACTIVE FREQUENCY</span>
-              <span className="text-cyan">124.850 MHz</span>
-            </div>
-          </div>
+          </Card>
         </div>
 
-        {/* Right Column: Authorization Card & Controls */}
-        <div className="cyber-card sentinel-auth-card">
-          <div className="cyber-card-header">
-            <span className="cyber-card-title">AUTHORIZATION</span>
-            <span className={`auth-badge ${isApproved ? "auth--approved" : snapshot.sentinel_state === "AWAITING_ATC" ? "auth--pending" : "auth--standby"}`}>
-              {isApproved ? "✓ APPROVED" : snapshot.sentinel_state === "AWAITING_ATC" ? "⏳ PENDING" : "STANDBY"}
-            </span>
-          </div>
-
-          <div className="auth-card-body">
-            <div className="auth-details-grid">
-              <div className="auth-field">
-                <span className="auth-label">Valid for incident</span>
-                <span className="auth-val mono">{incident ? shortId(incident.incident_id) : "INC-2024-001"}</span>
+        <div className="stack">
+          <Card title="ATC decision" icon="shield" className="decision-card">
+            <div className={`auth-status auth-status--${status.tone}`}>
+              <span className="auth-status__icon" aria-hidden="true">
+                <Icon name={status.icon} size={24} />
+              </span>
+              <div>
+                <p className={`auth-status__title text-${status.tone}`}>{status.title}</p>
+                <p className="auth-status__detail">{status.detail}</p>
               </div>
-              <div className="auth-field">
-                <span className="auth-label">Expires at</span>
-                <span className="auth-val mono text-alert">00:15:00</span>
+              {latest && <span className="auth-status__time mono">{formatClock(latest.decision.executed_at)}</span>}
+            </div>
+            <dl className="mini-grid">
+              <div>
+                <dt>Incident</dt>
+                <dd className="mono">{incident ? `INC-${shortId(incident.incident_id)}` : "—"}</dd>
               </div>
-            </div>
-
-            {/* Electronic Signature */}
-            <div className="atc-signature-block">
-              <span className="auth-label">ATC CONTROL SIGNATURE</span>
-              <svg viewBox="0 0 200 45" className="signature-svg">
-                <path
-                  d="M 10 25 Q 30 5, 50 25 T 90 25 T 130 10 T 170 30 T 190 20"
-                  fill="none"
-                  stroke={isApproved ? "#10b981" : "#38bdf8"}
-                  strokeWidth="2"
-                />
-              </svg>
-            </div>
-
-            {/* Link Quality Meter */}
-            <div className="link-quality-block">
-              <div className="quality-label-row">
-                <span className="auth-label">ATC LINK QUALITY</span>
-                <span className="mono text-cyan">98%</span>
+              <div>
+                <dt>Scenario run</dt>
+                <dd className="mono">{shortId(snapshot.scenario_run_id)}</dd>
               </div>
-              <div className="link-meter-track">
-                <div className="link-meter-fill" style={{ width: "98%" }} />
+              <div>
+                <dt>Sentinel</dt>
+                <dd>
+                  <Chip tone={SENTINEL_TONE[snapshot.sentinel_state]}>{humanize(snapshot.sentinel_state)}</Chip>
+                </dd>
               </div>
-            </div>
+              <div>
+                <dt>Last decision</dt>
+                <dd className="mono">{latest ? `#${latest.seq}` : "—"}</dd>
+              </div>
+            </dl>
 
-            {/* Decision Blocker for Tests */}
-            <div data-testid="decision-blocker" className="decision-hint-box">
-              {blocker ? (
-                <span className="text-warn">{blocker}</span>
-              ) : (
-                <span className="text-ok">Decision required: Sentinel is awaiting simulated ATC authorization.</span>
-              )}
-            </div>
-
-            {/* Action selector & Buttons */}
-            <div className="atc-action-controls">
-              <label className="field-select-row">
-                <span className="auth-label">Action:</span>
-                <select
-                  value={action}
-                  onChange={(e) => setAction(e.target.value as SimulatorActionType)}
-                  disabled={Boolean(blocker)}
-                  className="cyber-select"
-                >
-                  {APPROVABLE_ACTIONS.map((a) => (
-                    <option key={a} value={a}>
-                      {a}
-                    </option>
-                  ))}
-                </select>
+            <form className="form" onSubmit={(e) => e.preventDefault()}>
+              <fieldset className="actions-list" disabled={blocker !== null}>
+                <legend className="field__label">Symbolic action to authorize</legend>
+                {APPROVABLE_ACTIONS.map((a, i) => {
+                  const wasExecuted = executed?.action_type === a && executed.result === "EXECUTED";
+                  return (
+                    <label key={a} className={`action-row ${action === a ? "is-selected" : ""} ${wasExecuted ? "is-done" : ""}`}>
+                      <input type="radio" name="sim-action" value={a} checked={action === a} onChange={() => setAction(a)} />
+                      <span className="action-row__num">{i + 1}</span>
+                      <span className="action-row__name">
+                        {humanize(a)}
+                        <span className="mono action-row__code">{a}</span>
+                      </span>
+                      <span className="action-row__state">
+                        {wasExecuted ? (
+                          <>
+                            <Icon name="check" size={12} /> Executed {formatClock(executed?.applied_at)}
+                          </>
+                        ) : action === a ? (
+                          "Selected"
+                        ) : (
+                          "Available"
+                        )}
+                      </span>
+                    </label>
+                  );
+                })}
+              </fieldset>
+              <label className="field">
+                <span className="field__label">Operator ID (fictional)</span>
+                <input className="input" value={operatorId} maxLength={64} onChange={(e) => setOperatorId(e.target.value)} aria-invalid={!operatorValid} />
               </label>
-
-              <div className="decision-btn-row">
-                <button
-                  type="button"
-                  className="btn btn--primary btn--approve"
-                  disabled={Boolean(blocker)}
-                  onClick={() => commands.atcDecision("APPROVE", action, operatorId)}
-                >
+              {!operatorValid && <p className="field__error">Operator ID is required.</p>}
+              <div className="decision-actions">
+                <button type="button" className="btn btn--approve" disabled={blocker !== null || !operatorValid} onClick={() => commands.atcDecision("APPROVE", action, operatorId.trim())}>
+                  <Icon name="check" size={15} />
                   Approve {action}
                 </button>
-                <button
-                  type="button"
-                  className="btn btn--ghost btn--reject"
-                  disabled={Boolean(blocker)}
-                  onClick={() => commands.atcDecision("REJECT", "NO_OP", operatorId)}
-                >
+                <button type="button" className="btn btn--reject" disabled={blocker !== null || !operatorValid} onClick={() => commands.atcDecision("REJECT", action, operatorId.trim())}>
+                  <Icon name="x" size={15} />
                   Reject
                 </button>
               </div>
+              {blocker && (
+                <p className="hint hint--blocker" data-testid="decision-blocker">
+                  <Icon name="info" size={13} /> {blocker}
+                </p>
+              )}
+            </form>
+          </Card>
 
-              {/* Link toggle for simulation */}
-              <div className="link-toggle-row">
-                <button
-                  type="button"
-                  className="btn btn--small btn--ghost"
-                  onClick={() => commands.setLink(!link.atc_link_connected)}
-                  disabled={pending !== null}
-                >
-                  {link.atc_link_connected ? "Simulate Disconnection" : "Reconnect Simulated Link"}
-                </button>
-              </div>
-            </div>
-          </div>
+          <Card title="Sentinel state" icon="radar">
+            <StateTrack label="Sentinel state" steps={SENTINEL_TRACK} alternates={SENTINEL_ALTERNATES} current={snapshot.sentinel_state} toneOf={SENTINEL_TONE} format={humanize} />
+            <LastActionCard action={executed} />
+          </Card>
+
+          <Card title={`Decision history (${decisions.length})`} icon="list">
+            <SentinelDecisionList decisions={decisions} />
+          </Card>
         </div>
       </div>
     </div>

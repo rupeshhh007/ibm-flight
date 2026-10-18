@@ -1,276 +1,199 @@
 import { useMemo } from "react";
-import { CockpitCameraFeed } from "../components/CockpitCameraFeed";
-import { TacticalFlightMap } from "../components/TacticalFlightMap";
-import { humanize } from "../components/format";
-import { Empty } from "../components/ui";
+import { PILOT_IDS, type PilotSnapshot } from "../api/types";
+import { Chip, flightStatus, Sparkline, StatusTile, TelemetryStrip } from "../components/console";
+import { formatClock, formatHeading, formatNumber, humanize, pilotLabel, shortId } from "../components/format";
+import { Icon } from "../components/icons";
+import { FlightScene } from "../components/scene/FlightScene";
+import { GUARDIAN_TONE, OBSERVATION_TONE, SENTINEL_TONE } from "../components/tones";
+import { concernCounts, eventsForRun, incidentEventTime, observationSummary, pilotObservations, runMilestones, sceneSamples } from "../hooks/selectors";
 import { useAeroGuard } from "../hooks/useAeroGuard";
-import { soundEffects } from "../utils/soundEffects";
+
+function PilotStatusCard({ pilot, qualities, compact = false }: { pilot: PilotSnapshot; qualities: number[]; compact?: boolean }) {
+  const obs = pilot.latest_observation ?? null;
+  const tone = obs ? OBSERVATION_TONE[obs.observation_status] : "muted";
+  return (
+    <div className={`pcard pcard--${tone}`}>
+      <div className="pcard__head">
+        <Icon name="user" size={14} />
+        <span className="pcard__name">
+          {pilotLabel(pilot.pilot_id)} <span className="pcard__seat">({pilot.pilot_id === "PILOT_1" ? "Captain" : "First Officer"})</span>
+        </span>
+      </div>
+      <div className={`pcard__status pcard__status--${tone}`}>
+        <Icon name={obs?.observation_status === "RESPONSIVE" ? "check" : obs ? "alert" : "info"} size={15} />
+        {obs ? humanize(obs.observation_status) : "No observation"}
+      </div>
+      {!compact && (
+      <div className="pcard__row pcard__row--spark">
+        <span className="pcard__metric">
+          <span>Observation quality</span>
+          <span className="mono pcard__value">{obs ? obs.observation_quality.toFixed(2) : "—"}</span>
+          <span className="mono">Last {obs ? formatClock(obs.observed_at) : "—"}</span>
+        </span>
+        <Sparkline values={qualities} tone={tone} label={`${pilotLabel(pilot.pilot_id)} observation quality this run`} />
+      </div>
+      )}
+    </div>
+  );
+}
 
 export function FlightDeckPage() {
-  const { snapshot, events, pending, commands } = useAeroGuard();
+  const { snapshot, scenarios, events, pending, commands } = useAeroGuard();
+  const runEvents = useMemo(() => eventsForRun(events, snapshot?.scenario_run_id), [events, snapshot?.scenario_run_id]);
+  const samples = useMemo(() => sceneSamples(runEvents), [runEvents]);
+  const incident = snapshot?.active_incident ?? null;
+  const incidentAt = useMemo(() => incidentEventTime(runEvents, incident?.incident_id), [runEvents, incident?.incident_id]);
+  const concerns = useMemo(() => concernCounts(runEvents), [runEvents]);
+  const summary = useMemo(() => observationSummary(runEvents), [runEvents]);
+  const milestones = useMemo(() => runMilestones(runEvents), [runEvents]);
+  const qualities = useMemo(
+    () => Object.fromEntries(PILOT_IDS.map((id) => [id, pilotObservations(runEvents, id).map((o) => o.obs.observation_quality)])),
+    [runEvents],
+  );
 
-  const incidentTitle = snapshot?.active_incident?.incident_type ? humanize(snapshot.active_incident.incident_type) : "Loss of Response";
-
-  const pilot1 = snapshot?.pilots.find((p) => p.pilot_id === "PILOT_1") ?? {
-    pilot_id: "PILOT_1",
-    latest_observation: null,
-  };
-  const pilot2 = snapshot?.pilots.find((p) => p.pilot_id === "PILOT_2") ?? {
-    pilot_id: "PILOT_2",
-    latest_observation: null,
-  };
-
-  const runEvents = useMemo(() => {
-    if (!snapshot?.scenario_run_id) return [];
-    return events.filter((e) => e.scenario_run_id === snapshot.scenario_run_id);
-  }, [events, snapshot?.scenario_run_id]);
-
-  const progressPercent = Math.min(100, Math.round((runEvents.length / 18) * 100));
-
-  if (!snapshot) return <Empty>Loading Flight Deck telemetry…</Empty>;
+  const status = flightStatus(snapshot);
+  const t = snapshot?.telemetry ?? null;
+  const emergency = Boolean(incident);
+  const scenarioName = scenarios?.find((s) => s.scenario_id === snapshot?.scenario_id)?.name ?? snapshot?.scenario_id ?? "No scenario";
+  const pilots = PILOT_IDS.map((id) => snapshot?.pilots.find((p) => p.pilot_id === id) ?? { pilot_id: id, latest_observation: null });
+  const link = snapshot?.communication.atc_link_connected ?? false;
+  const action = snapshot?.last_simulator_action ?? null;
 
   return (
-    <div className="flight-deck-layout">
-      {/* Top Grid: Tactical Flight Map & Systems Status */}
-      <div className="flight-deck-main-grid">
-        {/* Realistic Interactive Satellite Tactical Map */}
-        <div className="tactical-map-container">
-          <TacticalFlightMap
-            telemetry={snapshot.telemetry}
-            isIncident={Boolean(snapshot.active_incident)}
-            incidentLabel={incidentTitle}
-            runEventsCount={runEvents.length}
-          />
-        </div>
-
-        {/* Aircraft Systems Status Card */}
-        <div className="aircraft-systems-card">
-          <div className="systems-card-header">
-            <span className="systems-title">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="9" />
-                <line x1="12" y1="3" x2="12" y2="7" />
-                <line x1="12" y1="17" x2="12" y2="21" />
-                <line x1="3" y1="12" x2="7" y2="12" />
-                <line x1="17" y1="12" x2="21" y2="12" />
-              </svg>
-              AIRCRAFT STATUS
-            </span>
+    <div className="deck">
+      <section className={`hero hero--${status.tone}`} aria-label="Flight deck">
+        <FlightScene
+          samples={samples}
+          incidentAt={incidentAt}
+          incidentLabel={incident ? humanize(incident.incident_type) : null}
+          emergency={emergency}
+          actionLabel={action ? `SYMBOLIC ACTION ${humanize(action.result).toUpperCase()}: ${action.action_type}` : null}
+        />
+        <div className="hero__overlay">
+          <div className="hero__top">
+            <TelemetryStrip snapshot={snapshot} overlay />
           </div>
 
-          <div className="systems-wireframe-container">
-            <svg viewBox="0 0 160 180" className="aircraft-wireframe-svg">
-              <defs>
-                <linearGradient id="wireframeGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.8" />
-                  <stop offset="100%" stopColor="#0284c7" stopOpacity="0.4" />
-                </linearGradient>
-              </defs>
-              {/* Aircraft wireframe silhouette */}
-              <path
-                d="M 80 15 
-                   C 83 25, 85 45, 85 85 
-                   L 145 105 L 145 116 L 85 105 
-                   L 84 145 L 105 155 L 105 162 L 80 158 
-                   L 55 162 L 55 155 L 76 145 
-                   L 75 105 L 15 116 L 15 105 L 75 85 
-                   C 75 45, 77 25, 80 15 Z"
-                fill="none"
-                stroke="url(#wireframeGrad)"
-                strokeWidth="1.5"
-              />
-              {/* Engine positions */}
-              <circle cx="108" cy="98" r="4" fill="#10b981" />
-              <circle cx="52" cy="98" r="4" fill="#10b981" />
-              <line x1="80" y1="30" x2="80" y2="155" stroke="rgba(56, 189, 248, 0.2)" strokeDasharray="2 2" />
-            </svg>
-
-            <div className="systems-metrics-overlay">
-              <div className="system-metric-row">
-                <span className="metric-label">ENG 1</span>
-                <span className="metric-val mono text-ok">98%</span>
+          <aside className={`fstatus fstatus--${status.tone}`} aria-label="Flight status">
+            <span className="fstatus__label">Flight status</span>
+            <span className="fstatus__value">{status.label}</span>
+            <span className="fstatus__detail">{status.detail}</span>
+            <div className="fstatus__ac">
+              <span className="mono">{t?.aircraft_id ?? "No aircraft"}</span>
+              <span className="fstatus__sub">Synthetic simulated aircraft</span>
+            </div>
+            <dl className="fstatus__grid">
+              <div>
+                <dt>Altitude</dt>
+                <dd className="mono">{t ? `${formatNumber(t.altitude_ft)} ft` : "—"}</dd>
               </div>
-              <div className="system-metric-row">
-                <span className="metric-label">ENG 2</span>
-                <span className="metric-val mono text-ok">97%</span>
+              <div>
+                <dt>Speed</dt>
+                <dd className="mono">{t ? `${formatNumber(t.airspeed_kts)} kt` : "—"}</dd>
               </div>
-              <div className="system-metric-row">
-                <span className="metric-label">FUEL</span>
-                <span className="metric-val mono text-cyan">72%</span>
+              <div>
+                <dt>Heading</dt>
+                <dd className="mono">{t ? formatHeading(t.heading_deg) : "—"}</dd>
               </div>
-              <div className="system-metric-row">
-                <span className="metric-label">HYDRAULICS</span>
-                <span className="metric-val mono text-ok">OK</span>
+              <div>
+                <dt>Phase</dt>
+                <dd>{t ? humanize(t.flight_phase) : "—"}</dd>
               </div>
-              <div className="system-metric-row">
-                <span className="metric-label">AUTOPILOT</span>
-                <span className="metric-val mono text-cyan">
-                  {snapshot.last_simulator_action?.action_type ?? "ENGAGED"}
+            </dl>
+            {incident ? (
+              <div className="fstatus__incident">
+                <span className="fstatus__label">Active incident</span>
+                <strong className="mono">{incident.incident_type}</strong>
+                <span>
+                  {humanize(incident.severity)} · {humanize(incident.guardian_state)}
+                </span>
+                <span className="fstatus__bar" aria-hidden="true" />
+              </div>
+            ) : (
+              <div className="fstatus__scenario">
+                <span className="fstatus__label">Active scenario</span>
+                <strong>{scenarioName}</strong>
+                <span className="mono">
+                  {snapshot?.scenario_run_id ? `Run ${shortId(snapshot.scenario_run_id)} · T ${formatClock(snapshot.virtual_time)}` : "Start one from Scenarios"}
                 </span>
               </div>
-            </div>
+            )}
+          </aside>
 
-            {/* Avionics Audio Soundboard Strip */}
-            <div className="audio-soundboard-strip">
-              <span className="soundboard-title">AVIONICS SOUND SYSTEM</span>
-              <div className="soundboard-buttons">
-                <button
-                  type="button"
-                  className="sound-cue-btn sound-cue-warning"
-                  title="Test Master Warning Klaxon (Dual-Pilot Emergency)"
-                  onClick={() => soundEffects.playMasterWarning(2400)}
-                >
-                  🚨 Klaxon Alert
-                </button>
-                <button
-                  type="button"
-                  className="sound-cue-btn sound-cue-caution"
-                  title="Test Master Caution Ding-Dong Chime"
-                  onClick={() => soundEffects.playMasterCaution()}
-                >
-                  ⚠️ Caution Chime
-                </button>
-                <button
-                  type="button"
-                  className="sound-cue-btn sound-cue-atc"
-                  title="Test ATC Radio Transmission Chime"
-                  onClick={() => soundEffects.playATCRadioChime()}
-                >
-                  📻 ATC Radio
-                </button>
-                <button
-                  type="button"
-                  className="sound-cue-btn sound-cue-ack"
-                  title="Test Pilot Acknowledgment Confirm Chime"
-                  onClick={() => soundEffects.playAckChime()}
-                >
-                  ✅ Pilot Ack
-                </button>
-                <button
-                  type="button"
-                  className="sound-cue-btn sound-cue-action"
-                  title="Test Stabilize Action Lock Tone"
-                  onClick={() => soundEffects.playActionTone()}
-                >
-                  🛡️ Stabilize
-                </button>
-                <button
-                  type="button"
-                  className="sound-cue-btn"
-                  title="Test Camera Obstructed Caution Tone"
-                  onClick={() => soundEffects.playSensorCaution()}
-                >
-                  👁️ Sensor Blip
-                </button>
+          <aside className="hero__right">
+            {incident && snapshot && (
+              <div className="gpanel" role="group" aria-label="Guardian escalation">
+                <div className="gpanel__head">
+                  <Icon name="alert" size={22} />
+                  <div>
+                    <span className="gpanel__label">Guardian status</span>
+                    <span className="gpanel__value">{humanize(snapshot.guardian_state)}</span>
+                  </div>
+                </div>
+                <span className="gpanel__sub">
+                  {snapshot.sentinel_state === "AWAITING_ATC" ? "Awaiting ATC decision" : `Sentinel ${humanize(snapshot.sentinel_state).toLowerCase()}`}
+                </span>
+                <ul className="gpanel__list">
+                  <li>
+                    <Icon name="user" size={14} /> Pilot 1: {concerns.PILOT_1} concern observation{concerns.PILOT_1 === 1 ? "" : "s"}
+                  </li>
+                  <li>
+                    <Icon name="user" size={14} /> Pilot 2: {concerns.PILOT_2} concern observation{concerns.PILOT_2 === 1 ? "" : "s"}
+                  </li>
+                  <li>
+                    <Icon name="list" size={14} /> Evidence collected: {incident.evidence_event_ids.length} observations
+                  </li>
+                  <li>
+                    <Icon name="clock" size={14} /> Incident raised: {formatClock(incident.created_at)}
+                  </li>
+                </ul>
+                <div className="gpanel__actions">
+                  <a className="btn btn--danger-solid btn--sm" href="#sentinel">
+                    Open Sentinel console <Icon name="chevron" size={12} />
+                  </a>
+                  {PILOT_IDS.map((id) => (
+                    <button key={id} type="button" className="btn btn--ghost btn--sm" disabled={pending !== null} onClick={() => commands.acknowledge(id)}>
+                      Acknowledge as {pilotLabel(id)}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
-          </div>
-        </div>
+            )}
+            {pilots.map((p) => (
+              <PilotStatusCard key={p.pilot_id} pilot={p} qualities={qualities[p.pilot_id] ?? []} compact={emergency} />
+            ))}
+          </aside>
 
-        {/* Dual Pilot Monitoring Feeds */}
-        <div className="pilot-feeds-column">
-          <CockpitCameraFeed
-            pilot={pilot1}
-            role="Captain"
-            onAcknowledge={snapshot.active_incident ? () => commands.acknowledge("PILOT_1") : undefined}
-            ackDisabled={pending !== null}
-          />
-          <CockpitCameraFeed
-            pilot={pilot2}
-            role="First Officer"
-            onAcknowledge={snapshot.active_incident ? () => commands.acknowledge("PILOT_2") : undefined}
-            ackDisabled={pending !== null}
-          />
+          <p className="hero__caption">Synthetic scene · illustrative route · waypoints are telemetry samples · not for navigation</p>
         </div>
-      </div>
+      </section>
 
-      {/* Bottom Status & Quick Scenario Advance Ribbon */}
-      <div className="flight-deck-bottom-ribbon">
-        <div className="agent-status-tile">
-          <div className="agent-tile-icon guardian-color">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-            </svg>
+      <div className="deck__status">
+        <StatusTile icon="shield" title="Guardian" value={snapshot ? humanize(snapshot.guardian_state) : "—"} tone={snapshot ? GUARDIAN_TONE[snapshot.guardian_state] : "muted"} detail={incident ? "Incident active" : "Monitoring"} />
+        <StatusTile icon="radar" title="Sentinel" value={snapshot ? humanize(snapshot.sentinel_state) : "—"} tone={snapshot ? SENTINEL_TONE[snapshot.sentinel_state] : "muted"} detail={`ATC link ${link ? "connected" : "disconnected"}`} />
+        <StatusTile icon="vision" title="Vision" value={`${summary.total} observations`} tone={summary.total ? "info" : "muted"} detail={`${summary.cameraUnavailable} camera-unavailable this run`} />
+        <StatusTile icon="plane" title="Simulator" value={t ? humanize(t.flight_phase) : snapshot?.scenario_run_id ? "Running" : "Idle"} tone={snapshot?.scenario_run_id ? "info" : "muted"} detail={action ? `Last action ${action.action_type}` : "No action executed"} />
+        <div className="scard">
+          <div className="scard__col">
+            <span className="scard__label">Scenario</span>
+            <strong className={emergency ? "text-alert" : ""}>{scenarioName}</strong>
+            <span className="mono scard__meta">{snapshot?.scenario_run_id ? `Run ${shortId(snapshot.scenario_run_id)}` : "No active run"}</span>
           </div>
-          <div>
-            <span className="tile-title">GUARDIAN</span>
-            <span className="tile-status mono">{humanize(snapshot.guardian_state)}</span>
-          </div>
-        </div>
-
-        <div className="agent-status-tile">
-          <div className="agent-tile-icon sentinel-color">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="2" />
-              <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49" />
-            </svg>
-          </div>
-          <div>
-            <span className="tile-title">SENTINEL</span>
-            <span className="tile-status mono">
-              {snapshot.communication.atc_link_connected ? "ATC Connected" : "ATC Offline"}
+          <div className="scard__col">
+            <span className="scard__label">Progress</span>
+            <strong className="mono">{runEvents.length} events</strong>
+            <span className="scard__meta">
+              {milestones.length} milestones · T {formatClock(snapshot?.virtual_time)}
             </span>
-          </div>
-        </div>
-
-        <div className="agent-status-tile">
-          <div className="agent-tile-icon vision-color">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M23 7l-7 5 7 5V7z" />
-              <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-            </svg>
-          </div>
-          <div>
-            <span className="tile-title">VISION</span>
-            <span className="tile-status mono">2 Cameras Active</span>
-          </div>
-        </div>
-
-        <div className="agent-status-tile">
-          <div className="agent-tile-icon simulator-color">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
-            </svg>
-          </div>
-          <div>
-            <span className="tile-title">SIMULATOR</span>
-            <span className="tile-status mono">Running</span>
-          </div>
-        </div>
-
-        <div className="scenario-progress-tile">
-          <div className="scenario-meta">
-            <span className="tile-title">SCENARIO</span>
-            <span className="scenario-name text-alert">{snapshot.scenario_id ? humanize(snapshot.scenario_id) : "Normal Flight"}</span>
-          </div>
-          <div className="progress-info">
-            <div className="progress-bar-track">
-              <div className="progress-bar-fill" style={{ width: `${progressPercent}%` }} />
-            </div>
-            <div className="progress-text-row mono">
-              <span>{runEvents.length} / 18 events</span>
-              <span>{progressPercent}%</span>
+            <div className="scard__ticks" aria-hidden="true">
+              {milestones.slice(-14).map((m) => (
+                <span key={m.seq} className={`scard__tick scard__tick--${m.tone}`} />
+              ))}
             </div>
           </div>
-        </div>
-
-        <div className="quick-advance-controls">
-          <button
-            type="button"
-            className="btn btn--primary btn--compact"
-            disabled={pending !== null || !snapshot.scenario_run_id}
-            onClick={() => commands.advance(1000)}
-          >
-            Advance +1000 ms
-          </button>
-          <button
-            type="button"
-            className="btn btn--ghost btn--compact"
-            disabled={pending !== null || !snapshot.scenario_run_id}
-            onClick={() => commands.reset()}
-          >
-            Reset
-          </button>
+          <Chip tone={status.tone} live={status.tone === "alert"}>
+            {status.label}
+          </Chip>
         </div>
       </div>
     </div>

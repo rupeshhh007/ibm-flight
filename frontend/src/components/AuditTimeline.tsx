@@ -1,81 +1,95 @@
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { eventLabel } from "../api/events";
 import type { EventType, StoredEvent } from "../api/types";
 import { formatVirtualTime, shortId } from "./format";
-import type { Tone } from "./tones";
-import { Empty, Pill } from "./ui";
-
-const TYPE_TONE: Record<EventType, Tone> = {
-  SCENARIO_STARTED: "info",
-  SCENARIO_ADVANCED: "muted",
-  PILOT_OBSERVATION: "muted",
-  TELEMETRY_UPDATED: "muted",
-  PILOT_ACKNOWLEDGED: "ok",
-  ATC_LINK_CHANGED: "info",
-  GUARDIAN_INCIDENT: "alert",
-  ATC_DECISION: "warn",
-  SENTINEL_DECISION: "warn",
-  SIMULATOR_ACTION: "ok",
-  SCENARIO_RESET: "info",
-  SCENARIO_COMPLETED: "info",
-};
+import { Icon } from "./icons";
+import { EVENT_TONE } from "./tones";
+import { Badge, Empty, Segmented } from "./ui";
 
 const NOISY: EventType[] = ["SCENARIO_ADVANCED", "TELEMETRY_UPDATED", "PILOT_OBSERVATION"];
 
 /**
  * Append-only audit history ordered by committed `seq` (never by timestamp).
- * Each row expands to the raw StoredEvent JSON so judges can inspect it.
+ * The table scrolls inside a fixed-height region so long histories never stretch
+ * the page; each row expands to the raw StoredEvent JSON for inspection.
  */
 export function AuditTimeline({ events, currentRunId }: { events: StoredEvent[]; currentRunId: string | null | undefined }) {
-  const [scope, setScope] = useState<"run" | "all">("run");
+  const [scope, setScope] = useState<"Current run" | "All runs">("Current run");
   const [hideNoisy, setHideNoisy] = useState(false);
   const [open, setOpen] = useState<number | null>(null);
 
   const visible = useMemo(() => {
-    let list = scope === "run" ? events.filter((e) => e.scenario_run_id === currentRunId) : events;
+    let list = scope === "Current run" ? events.filter((e) => e.scenario_run_id === currentRunId) : events;
     if (hideNoisy) list = list.filter((e) => !NOISY.includes(e.event_type));
     return [...list].reverse();
   }, [events, scope, hideNoisy, currentRunId]);
 
   return (
-    <div className="timeline">
-      <div className="timeline__controls" role="group" aria-label="Audit filters">
-        <div className="segmented">
-          <button type="button" className={scope === "run" ? "is-active" : ""} aria-pressed={scope === "run"} onClick={() => setScope("run")}>
-            Current run
-          </button>
-          <button type="button" className={scope === "all" ? "is-active" : ""} aria-pressed={scope === "all"} onClick={() => setScope("all")}>
-            All runs
-          </button>
-        </div>
+    <div className="audit">
+      <div className="toolbar" role="group" aria-label="Audit filters">
+        <Segmented label="Scope" options={["Current run", "All runs"] as const} value={scope} onChange={setScope} />
         <label className="check">
           <input type="checkbox" checked={hideNoisy} onChange={(e) => setHideNoisy(e.target.checked)} />
           Hide routine ticks
         </label>
-        <span className="meta">{visible.length} events</span>
+        <span className="toolbar__spacer" />
+        <span className="muted-text">{visible.length} events</span>
       </div>
       {visible.length === 0 ? (
-        <Empty>No events in this view yet.</Empty>
+        <Empty icon="list">No events in this view yet.</Empty>
       ) : (
-        <ol className="timeline__list">
-          {visible.map((event) => (
-            <li key={event.seq} className={`timeline__item ${event.scenario_run_id !== currentRunId ? "is-old-run" : ""}`}>
-              <button
-                type="button"
-                className="timeline__row"
-                aria-expanded={open === event.seq}
-                onClick={() => setOpen(open === event.seq ? null : event.seq)}
-              >
-                <span className="timeline__seq mono">#{event.seq}</span>
-                <Pill tone={TYPE_TONE[event.event_type]}>{eventLabel(event.event_type)}</Pill>
-                <span className="meta">{event.source}</span>
-                <span className="meta mono timeline__time">{formatVirtualTime(event.occurred_at)}</span>
-                <span className="meta mono">run {shortId(event.scenario_run_id)}</span>
-              </button>
-              {open === event.seq && <pre className="timeline__json">{JSON.stringify(event, null, 2)}</pre>}
-            </li>
-          ))}
-        </ol>
+        <div className="table-wrap table-wrap--scroll table-wrap--tall" tabIndex={0} role="region" aria-label="Audit events, scrollable">
+          <table className="table table--interactive">
+            <thead>
+              <tr>
+                <th scope="col" className="num">Seq</th>
+                <th scope="col">Event</th>
+                <th scope="col">Source</th>
+                <th scope="col">Virtual time</th>
+                <th scope="col">Run</th>
+                <th scope="col">
+                  <span className="sr-only">Expand</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map((event) => {
+                const expanded = open === event.seq;
+                return (
+                  <Fragment key={event.seq}>
+                    <tr className={event.scenario_run_id !== currentRunId ? "is-dim" : ""}>
+                      <td className="mono num muted-text">#{event.seq}</td>
+                      <td>
+                        <Badge tone={EVENT_TONE[event.event_type]}>{eventLabel(event.event_type)}</Badge>
+                      </td>
+                      <td className="muted-text">{event.source}</td>
+                      <td className="mono">{formatVirtualTime(event.occurred_at)}</td>
+                      <td className="mono muted-text">{shortId(event.scenario_run_id)}</td>
+                      <td className="cell-action">
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          aria-expanded={expanded}
+                          aria-label={`${expanded ? "Hide" : "Show"} raw JSON for event ${event.seq}`}
+                          onClick={() => setOpen(expanded ? null : event.seq)}
+                        >
+                          <Icon name="chevron" size={14} className={expanded ? "rot-90" : ""} />
+                        </button>
+                      </td>
+                    </tr>
+                    {expanded && (
+                      <tr className="json-row">
+                        <td colSpan={6}>
+                          <pre className="json">{JSON.stringify(event, null, 2)}</pre>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );

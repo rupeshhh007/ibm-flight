@@ -41,6 +41,14 @@ describe("parseErrorBody", () => {
   });
 });
 
+describe("5xx parsing", () => {
+  it("keeps plain-text 5xx errors neutral (the shared client cannot know whether a command was involved)", () => {
+    const error = parseErrorBody(500, "Internal Server Error");
+    expect(error.message).toBe("Backend internal error (HTTP 500).");
+    expect(error.code).toBe("HTTP_500");
+  });
+});
+
 describe("api client", () => {
   afterEach(() => vi.unstubAllGlobals());
 
