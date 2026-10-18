@@ -29,9 +29,15 @@ export function BlackBoxPage() {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState<Speed>("1x");
 
-  const replay = runEvents; // commit order
-  const index = selectedSeq === null ? replay.length - 1 : replay.findIndex((e) => e.seq === selectedSeq);
-  const selected: StoredEvent | null = (selectedSeq === null ? replay[replay.length - 1] : events.find((e) => e.seq === selectedSeq)) ?? null;
+  // Everything on the stage (transport, position, scene, incident zone, milestones) refers to ONE run:
+  // the run of the selected event, or the current run when nothing is selected. Selecting an older
+  // run's event under "All runs" therefore replays that run, never the current one.
+  const selectedEvent: StoredEvent | null = selectedSeq === null ? null : events.find((e) => e.seq === selectedSeq) ?? null;
+  const replayRunId = selectedEvent?.scenario_run_id ?? runId ?? null;
+  const replay = useMemo(() => eventsForRun(events, replayRunId), [events, replayRunId]); // commit order
+  const selected: StoredEvent | null = selectedEvent ?? replay[replay.length - 1] ?? null;
+  const index = selected ? replay.findIndex((e) => e.seq === selected.seq) : -1;
+  const historical = replayRunId !== null && replayRunId !== (runId ?? null);
 
   // A new run resets the replay cursor.
   useEffect(() => {
@@ -54,23 +60,22 @@ export function BlackBoxPage() {
     return () => clearInterval(timer);
   }, [playing, speed, replay]);
 
-  const samples = useMemo(() => sceneSamples(runEvents), [runEvents]);
+  const samples = useMemo(() => sceneSamples(replay), [replay]);
   const incidentId = useMemo(() => {
-    const hit = runEvents.find((e) => isEventOfType(e, "GUARDIAN_INCIDENT"));
+    const hit = replay.find((e) => isEventOfType(e, "GUARDIAN_INCIDENT"));
     return hit && isEventOfType(hit, "GUARDIAN_INCIDENT") ? hit.payload.incident_id : null;
-  }, [runEvents]);
-  const incidentAt = useMemo(() => incidentEventTime(runEvents, incidentId), [runEvents, incidentId]);
-  const milestones = useMemo(() => runMilestones(runEvents), [runEvents]);
+  }, [replay]);
+  const incidentAt = useMemo(() => incidentEventTime(replay, incidentId), [replay, incidentId]);
+  const milestones = useMemo(() => runMilestones(replay), [replay]);
 
-  // Reconstruct the scene at the selected event: aircraft at the last telemetry sample at/before it,
-  // incident zone only once the incident had been committed.
-  const cursorTime = selected && selected.scenario_run_id === runId ? new Date(selected.occurred_at).getTime() : Infinity;
-  const cursorSeq = selected && selected.scenario_run_id === runId ? selected.seq : Infinity;
+  // Reconstruct the replay run's scene at the selected event: aircraft at the last telemetry sample
+  // at/before it, incident zone only once that run's incident had been committed.
+  const cursorSeq = selected ? selected.seq : Infinity;
   let focusIndex: number | null = null;
-  runEvents.forEach((e) => {
+  replay.forEach((e) => {
     if (isEventOfType(e, "TELEMETRY_UPDATED") && e.seq <= cursorSeq) focusIndex = samples.findIndex((s) => s.telemetry === e.payload);
   });
-  const incidentVisible = incidentAt !== null && new Date(incidentAt).getTime() <= cursorTime && runEvents.some((e) => isEventOfType(e, "GUARDIAN_INCIDENT") && e.seq <= cursorSeq);
+  const incidentVisible = incidentAt !== null && replay.some((e) => isEventOfType(e, "GUARDIAN_INCIDENT") && e.seq <= cursorSeq);
 
   const list = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -115,15 +120,24 @@ export function BlackBoxPage() {
             </button>
             <Segmented label="Replay speed" options={SPEEDS} value={speed} onChange={setSpeed} />
           </div>
-          <div className="bb-position mono">
-            {replay.length ? `Event ${Math.max(index, 0) + 1} / ${replay.length}` : "No events"} · {selected ? formatClock(selected.occurred_at) : "—"}
+          <div className="bb-position mono" data-testid="replay-position">
+            {replay.length ? `Event ${Math.max(index, 0) + 1} / ${replay.length}` : "No events"} · {selected ? formatClock(selected.occurred_at) : "—"} · run{" "}
+            {shortId(replayRunId)}
           </div>
+          {historical && (
+            <div className="bb-historical" role="status">
+              <Chip tone="warn">Previous run</Chip>
+              <button type="button" className="btn btn--ghost btn--sm" onClick={() => { setPlaying(false); setSelectedSeq(null); }}>
+                Back to current run
+              </button>
+            </div>
+          )}
           <div className="bb-progress" aria-hidden="true">
             <span style={{ width: replay.length ? `${((Math.max(index, 0) + 1) / replay.length) * 100}%` : "0%" }} />
           </div>
         </div>
         <div className="bb-stage__scene">
-          <FlightScene samples={samples} incidentAt={incidentVisible ? incidentAt : null} incidentLabel="Guardian incident" emergency={incidentVisible} focusIndex={focusIndex} callsignVisible crop="band" />
+          <FlightScene key={replayRunId ?? "none"} samples={samples} incidentAt={incidentVisible ? incidentAt : null} incidentLabel="Guardian incident" emergency={incidentVisible} focusIndex={focusIndex} callsignVisible crop="band" />
           {selected && (
             <div className="bb-callout">
               <span className="mono">{formatClock(selected.occurred_at)}</span>

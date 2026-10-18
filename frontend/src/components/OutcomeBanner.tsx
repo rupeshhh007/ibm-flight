@@ -6,7 +6,7 @@ const TITLES: Record<CommandOutcome["status"], string> = {
   duplicate: "Duplicate command — backend returned the original result, nothing re-executed",
   rejected: "Rejected by backend",
   network: "Backend unreachable — command outcome unknown",
-  uncertain: "Transport error — command outcome uncertain; backend may have executed the action",
+  uncertain: "Command outcome uncertain — the backend may have executed the action",
 };
 
 const ICONS: Record<CommandOutcome["status"], IconName> = {

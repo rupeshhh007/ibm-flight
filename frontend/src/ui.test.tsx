@@ -282,10 +282,10 @@ describe("review regressions", () => {
     renderWith(<App />, makeClient(makeSnapshot(), { state: fail }));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("Backend internal error (HTTP 500).");
-    expect(alert.textContent).not.toMatch(/partly applied/);
+    expect(alert.textContent).not.toMatch(/may have executed|partly applied/);
   });
 
-  it("warns that a command hit by a 5xx may have partly applied", async () => {
+  it("warns that a command hit by a 5xx may have executed", async () => {
     const { ApiError } = await import("./api/client");
     const advanceScenario = vi.fn().mockRejectedValue(new ApiError("HTTP_500", "Backend internal error (HTTP 500).", 500));
     window.location.hash = "#simulation";
@@ -293,7 +293,7 @@ describe("review regressions", () => {
     const button = await screen.findByRole("button", { name: /Advance \+1000 ms/ });
     await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(button);
-    expect(await screen.findByText(/may have partly applied/)).toBeTruthy();
+    expect(await screen.findByText(/The command may have executed/)).toBeTruthy();
   });
 
   it("labels a pending Sentinel request as awaiting a decision", async () => {
@@ -398,5 +398,105 @@ describe("Vision", () => {
     renderWith(<VisionPage />, makeClient(snapshot));
     expect((await screen.findAllByText("0.93")).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/Synthetic · no camera image/).length).toBe(2);
+  });
+});
+
+describe("REVIEW FIX 1: command-side HTTP 5xx is an uncertain outcome", () => {
+  it("does not report a 5xx as a backend rejection and retries with the SAME command_id", async () => {
+    const { ApiError } = await import("./api/client");
+    const advanceScenario = vi
+      .fn()
+      .mockRejectedValueOnce(new ApiError("HTTP_500", "Backend internal error (HTTP 500).", 500))
+      .mockResolvedValueOnce(response({ message: "Advance confirmed on retry" }));
+    window.location.hash = "#scenarios";
+    renderWith(<App />, makeClient(makeSnapshot(), { advanceScenario }));
+    const button = await screen.findByRole("button", { name: /Advance \+1000 ms/ });
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+
+    expect(await screen.findByText(/Command outcome uncertain/)).toBeTruthy();
+    expect(screen.queryByText(/Rejected by backend/)).toBeNull();
+    const retry = screen.getByRole("button", { name: /Retry same command/ });
+    fireEvent.click(retry);
+    expect(await screen.findByText(/Advance confirmed on retry/)).toBeTruthy();
+    expect(advanceScenario).toHaveBeenCalledTimes(2);
+    expect(advanceScenario.mock.calls[1][0].command_id).toBe(advanceScenario.mock.calls[0][0].command_id);
+    expect(advanceScenario.mock.calls[1][0]).toEqual(advanceScenario.mock.calls[0][0]);
+  });
+
+  it("still reports a structured 409 as a confirmed rejection without a retry", async () => {
+    const { ApiError } = await import("./api/client");
+    const advanceScenario = vi.fn().mockRejectedValue(new ApiError("STALE_SCENARIO_RUN", "scenario_run_id does not match the active run", 409));
+    window.location.hash = "#scenarios";
+    renderWith(<App />, makeClient(makeSnapshot(), { advanceScenario }));
+    const button = await screen.findByRole("button", { name: /Advance \+1000 ms/ });
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+    expect(await screen.findByText(/Rejected by backend/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Retry same command/ })).toBeNull();
+  });
+});
+
+describe("REVIEW FIX 2: Black Box replays the selected event's run", () => {
+  const OLD_RUN = "33333333-3333-4333-8333-333333333333";
+  const telemetry = (seq: number, run: string, altitude: number) =>
+    makeEvent(seq, {
+      scenario_run_id: run,
+      event_type: "TELEMETRY_UPDATED",
+      source: "SIMULATOR",
+      occurred_at: `2026-01-01T00:00:0${seq % 10}Z`,
+      payload: {
+        aircraft_id: "AEROGUARD-SIM-001",
+        simulation_time: "2026-01-01T00:00:01Z",
+        altitude_ft: altitude,
+        airspeed_kts: 450,
+        heading_deg: 90,
+        latitude: 19,
+        longitude: 72,
+        flight_phase: "CRUISE",
+        active_warning_codes: [],
+      },
+    });
+  // Old run: start, telemetry at 30,000 ft, an incident. Current run: start, telemetry at 35,000 ft.
+  const events = [
+    makeEvent(1, { scenario_run_id: OLD_RUN, event_type: "SCENARIO_STARTED", payload: { scenario_id: "dual_pilot_atc_connected", started_at: "2026-01-01T00:00:00Z" } }),
+    telemetry(2, OLD_RUN, 30000),
+    makeEvent(3, { scenario_run_id: OLD_RUN, event_type: "GUARDIAN_INCIDENT", source: "GUARDIAN", payload: makeIncident({ scenario_run_id: OLD_RUN }) }),
+    makeEvent(4, { scenario_run_id: RUN_ID, event_type: "SCENARIO_STARTED", payload: { scenario_id: "normal_flight", started_at: "2026-01-01T00:00:00Z" } }),
+    telemetry(5, RUN_ID, 35000),
+  ];
+  const client = () =>
+    makeClient(makeSnapshot({ latest_event_seq: 5 }), {
+      events: (afterSeq: number) => Promise.resolve({ after_seq: afterSeq, events: afterSeq < 5 ? events : [], latest_event_seq: 5, limit: 500 }),
+    });
+
+  it("keeps the selected event, replay timeline and aircraft scene on the same (older) run", async () => {
+    renderWith(<BlackBoxPage />, client());
+    // Default: the current run.
+    expect(await screen.findByText(/Event 2 \/ 2/)).toBeTruthy();
+    expect(screen.getByTestId("replay-position").textContent).toContain(RUN_ID.slice(0, 8));
+    expect(screen.getByText(/FL350/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "All runs" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Select event 2" }));
+
+    const position = screen.getByTestId("replay-position").textContent ?? "";
+    expect(position).toContain(OLD_RUN.slice(0, 8));
+    expect(position).toMatch(/Event 2 \/ 3/); // seq 2 is the 2nd of the old run's 3 events
+    expect(screen.getByText(/FL300/)).toBeTruthy(); // old run's aircraft, not the current run's FL350
+    expect(screen.queryByText(/FL350/)).toBeNull();
+    expect(screen.getByText("Previous run")).toBeTruthy();
+    // The old run's milestones (including its incident) drive the rail, not the current run's.
+    expect(screen.getByRole("button", { name: /^Incident at/ })).toBeTruthy();
+
+    // Stepping stays inside the old run.
+    fireEvent.click(screen.getByRole("button", { name: "Next event" }));
+    expect(screen.getByTestId("replay-position").textContent).toMatch(/Event 3 \/ 3/);
+    expect(screen.getByTestId("replay-position").textContent).toContain(OLD_RUN.slice(0, 8));
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to current run" }));
+    expect(screen.getByTestId("replay-position").textContent).toContain(RUN_ID.slice(0, 8));
+    expect(screen.getByText(/FL350/)).toBeTruthy();
+    expect(screen.queryByText("Previous run")).toBeNull();
   });
 });
