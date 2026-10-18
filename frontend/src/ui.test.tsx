@@ -500,3 +500,43 @@ describe("REVIEW FIX 2: Black Box replays the selected event's run", () => {
     expect(screen.queryByText("Previous run")).toBeNull();
   });
 });
+
+describe("Restored real-data displays", () => {
+  it("shows the incident history from GET /api/v1/incidents on the Guardian view", async () => {
+    const older = makeIncident({ incident_id: "44444444-4444-4444-8444-444444444444", scenario_run_id: "55555555-5555-4555-8555-555555555555" });
+    const client = makeClient(makeSnapshot(), { incidents: () => Promise.resolve({ incidents: [older] }) });
+    renderWith(<GuardianPage />, client);
+    expect(await screen.findByText("Incident history (1)")).toBeTruthy();
+    expect(screen.getByText(/44444444 · run 55555555/)).toBeTruthy();
+  });
+
+  it("shows telemetry warning codes exactly as reported, or 'None active'", async () => {
+    const telemetry = {
+      aircraft_id: "AEROGUARD-SIM-001",
+      simulation_time: "2026-01-01T00:00:01Z",
+      altitude_ft: 35000,
+      airspeed_kts: 450,
+      heading_deg: 90,
+      latitude: 19,
+      longitude: 72,
+      flight_phase: "CRUISE" as const,
+      active_warning_codes: ["SIM_TEST_WARN"],
+    };
+    renderWith(<FlightDeckPage />, makeClient(makeSnapshot({ telemetry })));
+    const box = await screen.findByLabelText("Telemetry warning codes");
+    expect(box.textContent).toContain("SIM_TEST_WARN");
+    cleanup();
+    renderWith(<FlightDeckPage />, makeClient(makeSnapshot({ telemetry: { ...telemetry, active_warning_codes: [] } })));
+    expect((await screen.findByLabelText("Telemetry warning codes")).textContent).toContain("None active");
+  });
+
+  it("shows the simulated link details separately from backend connectivity", async () => {
+    const snapshot = makeSnapshot({ communication: { atc_link_connected: false, last_change_at: "2026-01-01T00:00:05Z", remote_sync_connected: false, pending_sync_count: 3 } });
+    renderWith(<SentinelPage />, makeClient(snapshot));
+    const details = await screen.findByLabelText("Simulated link details");
+    expect(details.textContent).toContain("Disconnected");
+    expect(details.textContent).toContain("00:00:05");
+    expect(details.textContent).toContain("Not connected");
+    expect(details.textContent).toContain("3");
+  });
+});

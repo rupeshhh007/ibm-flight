@@ -105,6 +105,26 @@ export function SentinelPage() {
         <div className="stack">
           <Card flush className="card--scene">
             <LinkScene connected={link.atc_link_connected} emergency={Boolean(incident)} aircraftId={snapshot.telemetry?.aircraft_id ?? "SIM"} />
+            {/* CommunicationStatus details (restored). The simulated ATC link is a scenario input,
+                distinct from this browser's backend connection and from optional remote sync. */}
+            <dl className="link-details" aria-label="Simulated link details">
+              <div>
+                <dt>Simulated ATC link</dt>
+                <dd className={link.atc_link_connected ? "text-ok" : "text-alert"}>{link.atc_link_connected ? "Connected" : "Disconnected"}</dd>
+              </div>
+              <div>
+                <dt>Last change (virtual)</dt>
+                <dd className="mono">{formatClock(link.last_change_at)}</dd>
+              </div>
+              <div>
+                <dt>Remote sync (optional)</dt>
+                <dd>{link.remote_sync_connected ? "Connected" : "Not connected"}</dd>
+              </div>
+              <div>
+                <dt>Pending sync</dt>
+                <dd className="mono">{link.pending_sync_count}</dd>
+              </div>
+            </dl>
           </Card>
           <Card title={`ATC communication (${log.length})`} icon="tower">
             <CommsLog entries={log} />

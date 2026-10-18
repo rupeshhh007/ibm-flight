@@ -3,7 +3,7 @@ import { isEventOfType, PILOT_IDS, type StoredEvent } from "../api/types";
 import { Card, Chip, SectionHeader, Sparkline, SyntheticPilot } from "../components/console";
 import { formatClock, humanize, pilotLabel, shortId } from "../components/format";
 import { Icon, type IconName } from "../components/icons";
-import { EvidenceTable } from "../components/StatePanels";
+import { EvidenceTable, IncidentList } from "../components/StatePanels";
 import { GUARDIAN_ALTERNATES, GUARDIAN_TONE, GUARDIAN_TRACK, OBSERVATION_TONE, type Tone } from "../components/tones";
 import { Empty, StateTrack } from "../components/ui";
 import { eventsForRun, pilotObservations, resolveEvidence } from "../hooks/selectors";
@@ -42,7 +42,7 @@ function guardianTimeline(events: readonly StoredEvent[]): TimelineItem[] {
 }
 
 export function GuardianPage() {
-  const { snapshot, events, pending, commands } = useAeroGuard();
+  const { snapshot, events, incidents, pending, commands } = useAeroGuard();
   const runEvents = useMemo(() => eventsForRun(events, snapshot?.scenario_run_id), [events, snapshot?.scenario_run_id]);
   const timeline = useMemo(() => guardianTimeline(runEvents), [runEvents]);
   const incident = snapshot?.active_incident ?? null;
@@ -160,24 +160,30 @@ export function GuardianPage() {
           <div id="guardian-evidence" />
           {incident ? <EvidenceTable evidence={evidence} /> : <Empty>Evidence appears with an active incident.</Empty>}
         </Card>
-        <Card title="Pilot acknowledgement" icon="check">
-          {incident ? (
-            <div className="ack">
-              <p className="hint">Sent to the backend for the active incident (alert {shortId(incident.incident_id)}). Guardian decides what it means.</p>
-              <div className="btn-row">
-                {PILOT_IDS.map((id) => (
-                  <button key={id} type="button" className="btn btn--primary" disabled={pending !== null} onClick={() => commands.acknowledge(id)}>
-                    Acknowledge as {pilotLabel(id)}
-                  </button>
-                ))}
+        <div className="stack">
+          <Card title="Pilot acknowledgement" icon="check">
+            {incident ? (
+              <div className="ack">
+                <p className="hint">Sent to the backend for the active incident (alert {shortId(incident.incident_id)}). Guardian decides what it means.</p>
+                <div className="btn-row">
+                  {PILOT_IDS.map((id) => (
+                    <button key={id} type="button" className="btn btn--primary" disabled={pending !== null} onClick={() => commands.acknowledge(id)}>
+                      Acknowledge as {pilotLabel(id)}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
-          ) : snapshot.guardian_state !== "NORMAL" ? (
-            <Empty icon="shield">Guardian state is {humanize(snapshot.guardian_state)} and there is no active incident. Acknowledgement is accepted only for an active incident.</Empty>
-          ) : (
-            <Empty icon="shield">No active incident. Acknowledgement controls appear when Guardian raises an alert.</Empty>
-          )}
-        </Card>
+            ) : snapshot.guardian_state !== "NORMAL" ? (
+              <Empty icon="shield">Guardian state is {humanize(snapshot.guardian_state)} and there is no active incident. Acknowledgement is accepted only for an active incident.</Empty>
+            ) : (
+              <Empty icon="shield">No active incident. Acknowledgement controls appear when Guardian raises an alert.</Empty>
+            )}
+          </Card>
+          {/* Incident history across all runs, from GET /api/v1/incidents (restored; bootstrap §12). */}
+          <Card title={`Incident history (${incidents.length})`} icon="list" flush>
+            <IncidentList incidents={incidents} activeId={incident?.incident_id} />
+          </Card>
+        </div>
       </div>
     </div>
   );

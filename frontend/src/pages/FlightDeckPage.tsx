@@ -100,6 +100,19 @@ export function FlightDeckPage() {
                 <dd>{t ? humanize(t.flight_phase) : "—"}</dd>
               </div>
             </dl>
+            {/* Real telemetry field active_warning_codes (restored); never synthesised client-side. */}
+            <div className="fstatus__warn" aria-label="Telemetry warning codes">
+              <span className="fstatus__label">Warning codes</span>
+              {t && t.active_warning_codes.length > 0 ? (
+                t.active_warning_codes.map((code) => (
+                  <Chip key={code} tone="warn">
+                    {code}
+                  </Chip>
+                ))
+              ) : (
+                <span className="fstatus__none">{t ? "None active" : "—"}</span>
+              )}
+            </div>
             {incident ? (
               <div className="fstatus__incident">
                 <span className="fstatus__label">Active incident</span>

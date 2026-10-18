@@ -745,6 +745,15 @@ code { font-size: 0.92em; }
 .runbar__switch { display: flex; align-items: center; gap: 10px; font: 700 14px/1 var(--display); letter-spacing: 0.08em; text-transform: uppercase; }
 .status-line { font-size: 12px; color: var(--text-3); }
 
+/* Restored data displays */
+.fstatus__warn { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.fstatus__warn .fstatus__label { margin-right: 4px; }
+.fstatus__none { font-size: 12px; color: var(--text-2); }
+.link-details { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 16px; margin: 0; padding: 12px 14px; border-top: 1px solid var(--line); background: rgba(4, 12, 26, 0.9); }
+.link-details dt { font: 700 11.5px/1.2 var(--display); letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-3); }
+.link-details dd { margin: 4px 0 0; font-weight: 600; }
+@media (max-width: 760px) { .link-details { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
 /* ---------- Motion ---------- */
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 @keyframes spin { to { transform: rotate(360deg); } }
