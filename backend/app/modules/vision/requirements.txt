@@ -1,0 +1,7 @@
+# AeroGuard Vision Subsystem Optional Dependencies
+# SIMULATION ONLY — NOT FOR OPERATIONAL AVIATION USE
+# For local workstation video/webcam capture and MediaPipe FaceMesh.
+# Optional module dependencies only; do NOT require on LinuxONE s390x.
+mediapipe==1.1.1
+opencv-contrib-python==5.0.0.93
+numpy==2.4.6
